@@ -1,0 +1,49 @@
+{
+ "exe": "E:\\code\\Strata\\engine\\strata.exe",
+ "args": [
+  "--pack",
+  "C:\\Strata-data\\packs\\iq3_s",
+  "--native",
+  "C:\\Strata-data\\models\\IQ3_S\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "C:\\Strata-data\\models\\IQ3_S\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "E:\\code\\Strata\\data\\expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "C:\\Strata-data\\mtp\\rt",
+  "--max-context",
+  "16384",
+  "--kv",
+  "int8",
+  "--vision",
+  "--vram-reserve-mib",
+  "700",
+  "--pool-workers",
+  "15"
+ ],
+ "cwd": "E:\\code\\Strata",
+ "tokenizer": "C:\\Strata-data\\packs\\iq3_s\\tokenizer",
+ "model_name": "qwen3.8-flash-next-iq3_s",
+ "log": "E:\\code\\Strata\\strata-iq3_s.log",
+ "lib_dirs": [
+  "E:\\code\\Strata\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
+ ],
+ "port": 8080,
+ "gpu": 0,
+ "gpus_asked": true,
+ "vision": {
+  "exe": "E:\\code\\Strata\\engine\\strata-vision.exe",
+  "mmproj": "C:\\Strata-data\\models\\mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "C:\\Strata-data\\models\\IQ3_S\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "gpu": true,
+  "max_tokens": 1024
+ }
+}

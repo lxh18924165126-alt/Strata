@@ -86,6 +86,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve.key_store import KeyStore, StoreUnavailable  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -377,6 +378,9 @@ class MockEngine:
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
+        started = getattr(cancel, "_strata_queue_started", None)
+        if started is not None:
+            started()
         if len(self.scripts) > 1:
             if self.cycle:
                 self.script = self.scripts[self.turns % len(self.scripts)]
@@ -2270,6 +2274,9 @@ class StrataEngine:
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        started = getattr(cancel, "_strata_queue_started", None)
+        if started is not None:
+            started()
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
@@ -3994,10 +4001,15 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
+        self.model_enabled = True                    # explicit console switch; idle unload still permits autoload
+        self.model_router = None
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.key_store = None                          # opt-in, database is authoritative when enabled
+        self.admin_api_key = ""
+        self.key_usage = threading.local()              # one HTTP invocation, independent of api_monitor
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -4424,9 +4436,47 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def require_model_enabled(self):
+        if not self.model_enabled:
+            raise EngineStarting("the model is disabled; enable it in the console first")
+
+    def model_state(self):
+        return {"enabled": self.model_enabled, "loaded": self.loaded(),
+                "supported": hasattr(self.engine, "unload") and hasattr(self.engine, "restart")}
+
+    def set_model_enabled(self, enabled):
+        """Change admission and residency together, between requests; never kill an active turn."""
+        if not self.model_state()["supported"]:
+            raise ValueError("this engine does not support the model switch")
+        if not self.fifo.acquire(blocking=False):
+            raise ModelBusy("a request is running or queued; try again when it has finished")
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    raise ModelBusy("a request is running or queued; try again when it has finished")
+                if not enabled:
+                    self.model_enabled = False
+            if enabled:
+                self.ensure_loaded(allow_disabled=True)
+                self.last_request_at = time.time()
+                self.model_enabled = True
+            else:
+                # Even a dead engine can retain pipes, and its encoder may still be resident.
+                try:
+                    self.engine.unload()
+                finally:
+                    if self.vision is not None:
+                        self.vision.unload()
+                    self.vision_held = False
+            return self.model_state()
+        finally:
+            self.fifo.release()
+
+    def ensure_loaded(self, allow_disabled=False):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        if not allow_disabled:
+            self.require_model_enabled()
         if self.loaded() and not self._vision_down():
             return
         hook_failed = None
@@ -4556,6 +4606,7 @@ class Service:
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
+        self.require_model_enabled()
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             return
@@ -4765,9 +4816,15 @@ class Service:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
+            running = {st["request_id"]: (dict(st), list(rate))
+                       for st, rate in self.live_reqs.values()}
+            if not self.live_reqs and self.status.get("busy") and self.status.get("request_id"):
+                running[self.status["request_id"]] = (dict(self.status), list(self.rate))
+            active = [dict(row) for row in self.terminal_requests.values()]
             hist = list(self.history)
             totals = dict(self.totals)
         now = time.time()
+        max_context = self.reported_ctx()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
             state = "reading"
@@ -4786,6 +4843,19 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+        live["requests"] = []
+        for row in active:
+            st, rate = running.get(row["id"], (None, None))
+            request_state = ("generating" if row.get("first_engine_token_s") is not None else
+                             "reading" if row["state"] == "reading" else
+                             "queued" if row["state"] == "queued" else "waiting")
+            live["requests"].append({"id": row["id"], "state": request_state,
+                                     "prompt_tokens": row["prompt_tokens"],
+                                     "generated": st["generated"] if st and request_state in ("reading", "generating") else None,
+                                     "max_tokens": row["max_tokens"], "max_context": max_context,
+                                     "tok_s": round(self._rate_of(st, rate), 1)
+                                     if st and request_state == "generating" else None,
+                                     "elapsed_s": round(now - row["queued_at"], 1)})
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -4808,7 +4878,7 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"model_control": self.model_state(), "engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -4872,7 +4942,8 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "enabled": self.model_enabled, "loaded": self.loaded(),
+            "auto_load": self.model_enabled and hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -4944,6 +5015,7 @@ class Service:
                 if cancel.is_set():
                     raise ClientGone()
         try:
+            self.require_model_enabled()
             yield
         finally:
             self.fifo.release()
@@ -4993,6 +5065,7 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        self.require_model_enabled()
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
         for message in messages:
             for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
@@ -5387,7 +5460,7 @@ class Service:
             self.status["queued"] += 1
             self.terminal_requests[request_id] = {"id": request_id, "state": "queued",
                                                     "queued_at": time.time(), "admitted_at": None,
-                                                    "prompt_tokens": len(ids)}
+                                                    "prompt_tokens": len(ids), "max_tokens": max_new}
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
         try:
@@ -5442,7 +5515,7 @@ class Service:
                             queued_counted = False
                             self.terminal_requests[request_id].update(state="waiting", admitted_at=time.time())
                             self._terminal_event_locked(request_id, "admitted")
-                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                        st.update(busy=True, request_id=request_id, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
@@ -5688,6 +5761,7 @@ class Service:
                 finally:
                     # #266: settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
+                    key_work = None
                     with self.status_lock:
                         if st.get("busy") and not timed_out:
                             last = request_stats(segments)          # only this request's own DONEs count
@@ -5701,6 +5775,7 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            key_work = (seen, last.get("reused"), n, finish)
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -5766,6 +5841,9 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
+                    usage = getattr(self.key_usage, "current", None)
+                    if usage is not None and key_work is not None:
+                        usage.add(*key_work)            # durable before the final usage event; outside status_lock
         except QueueCancelled:
             finish = "cancel"
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
@@ -6555,6 +6633,122 @@ class BadBody(Exception):
         self.status = status
 
 
+class KeyModelRouter:
+    """Share the resident model between requests, and wait for them before switching it."""
+    fields = ("engine", "tok", "template", "model", "vision", "literals", "stop_ids", "aliases",
+              "sampling_defaults", "effort_end")
+
+    def __init__(self, svc, configs):
+        self.svc = svc
+        self.configs = configs
+        self.condition = threading.Condition()
+        self.waiting = collections.deque()
+        self.active = 0
+        self.exclusive = False
+        self.default = svc.model
+        self.models = {svc.model: self.snapshot()}
+
+    @contextlib.contextmanager
+    def access(self, resolve=None):
+        """Admit same-model requests together; switches and controls wait their turn."""
+        ticket = object()
+        admitted, error = False, None
+        with self.condition:
+            self.waiting.append(ticket)
+            try:
+                while True:
+                    if self.waiting[0] is ticket and not self.exclusive:
+                        if resolve is None:
+                            if not self.active:
+                                self.exclusive = admitted = True
+                                break
+                        else:
+                            try:
+                                name = resolve()
+                                if name is None:
+                                    break
+                                if not self.active or not self.svc.model_enabled or name == self.svc.model:
+                                    if self.svc.model_enabled:
+                                        self.select(name)
+                                    self.active += 1
+                                    admitted = True
+                                    break
+                            except (ValueError, TypeError, KeyError, OSError, EngineDied, EngineStuck) as e:
+                                error = e
+                                break
+                    self.condition.wait()
+            finally:
+                self.waiting.remove(ticket)
+                self.condition.notify_all()
+        try:
+            yield admitted, error
+        finally:
+            if admitted:
+                with self.condition:
+                    if resolve is None:
+                        self.exclusive = False
+                    else:
+                        self.active -= 1
+                    self.condition.notify_all()
+
+    def snapshot(self):
+        return {name: getattr(self.svc, name) for name in self.fields}
+
+    def available(self):
+        return [self.default, *(name for name, path in self.configs.items() if Path(path).is_file())]
+
+    def build(self, name):
+        cfg = json.loads(Path(self.configs[name]).read_text(encoding="utf-8-sig"))
+        if default_model_name(cfg) != name:
+            raise ValueError("模型配置名称与登记名称不一致")
+        if cfg.get("replicas"):
+            raise ValueError("按需切换不支持 replicas")
+        tpath = Path(cfg["tokenizer"])
+        import strata_tokenizer as ST
+        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for token, index in vocab.items():
+            tokens[index] = token
+        tok = ST.Tokenizer(tokens, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                           json.loads((tpath / "token_type.json").read_text()))
+        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+        effort = effort_end_args(cfg, exe, tok)
+        engine = StrataEngine(exe, engine_args(cfg) + (effort or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                              env=child_env(cfg), lazy=True)
+        engine.silence_s = engine_silence_s(cfg)
+        vision = None
+        if cfg.get("vision"):
+            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                    for k, v in cfg["vision"].items()}
+            vision = Vision(vcfg, env=vision_env(cfg, child_env(cfg)), lazy=True)
+        tpl = tpath / "chat_template.jinja"
+        template = ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+        aliases = cfg.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [s.strip() for s in aliases.split(",") if s.strip()]
+        return {"engine": engine, "tok": tok, "template": template, "model": name, "vision": vision,
+                "literals": literal_tags(getattr(tok, "control_tokens", ())),
+                "stop_ids": set(tok.encode(IM_END, parse_special=True) + tok.encode("<|endoftext|>", parse_special=True)),
+                "aliases": aliases, "sampling_defaults": sampling_defaults_from_config(cfg), "effort_end": bool(effort)}
+
+    def select(self, name):
+        name = name or self.default
+        if name not in self.available():
+            raise ValueError(f"所选模型不可用：{name}")
+        if name == self.svc.model:
+            return
+        target = self.models.get(name) or self.build(name)
+        with self.svc.fifo:
+            self.svc.engine.unload()
+            if self.svc.vision is not None:
+                self.svc.vision.unload()
+            self.svc.vision_held = False
+            self.models[name] = target
+            for field, value in target.items():
+                setattr(self.svc, field, value)
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -6570,11 +6764,15 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             self.answer_started = False
+            self.key_id = None
+            self.usage = None
             super().handle_one_request()
             self._drain_body()
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            if getattr(self, "usage", None) is not None:
+                self.usage.note({"http_status": code})
             super().send_response(code, message)
 
         def _chunked(self) -> bool:
@@ -6683,7 +6881,7 @@ def make_handler(svc: Service):
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
-            if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
+            if svc.api_key or svc.key_store is not None or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
@@ -6700,7 +6898,7 @@ def make_handler(svc: Service):
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
             then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if svc.api_key or svc.key_store is not None or not origin:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -6754,6 +6952,8 @@ def make_handler(svc: Service):
 
         def _note(self, **values):
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
+            if getattr(self, "usage", None) is not None:
+                self.usage.note(values)
             if self.record is not None:
                 with svc.status_lock:
                     self.record.update(values)
@@ -6787,6 +6987,9 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None, retry_after=None):
+            if getattr(self, "usage", None) is not None:
+                self.usage.note({"http_status": code, "error": obj.get("error")})
+                self.usage.finish()                    # commit before sending a non-stream response
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -6798,6 +7001,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if self.path.split("?")[0].startswith("/api/keys"):
+                self.send_header("Cache-Control", "no-store")
             for k, v in (headers or {}).items():
                 self.send_header(k, str(v))
             if retry_after is not None:
@@ -6808,6 +7013,16 @@ def make_handler(svc: Service):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
+            if svc.key_store is not None:
+                try:
+                    self.key_id = svc.key_store.authenticate(self._given_key())
+                except StoreUnavailable as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return False
+                if self.key_id:
+                    return True
+                self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+                return False
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
@@ -6828,8 +7043,116 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong telemetry key"}})
             return False
 
+        def _given_key(self):
+            auth = self.headers.get("Authorization", "")
+            return auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+
+        def _keys_api(self, path, post=False):
+            if svc.key_store is None:
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            given = self._given_key()
+            if not given or not key_matches(given, [svc.admin_api_key]):
+                self._json(403 if given else 401, {"error": {"message": "需要独立的管理员密钥"}})
+                return
+            if self._foreign_origin():
+                self._json(403, {"error": {"message": "管理接口不允许跨域访问"}})
+                return
+            if post and not self._own_page("API Keys can be managed"):
+                return
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            start, end = query.get("from", [None])[0], query.get("to", [None])[0]
+            parts = path.strip("/").split("/")
+            try:
+                if not post and path == "/api/keys":
+                    self._json(200, {"keys": svc.key_store.list(query.get("include_deleted") == ["true"], start, end),
+                                     "timezone": "Asia/Shanghai",
+                                     "models": svc.model_router.available() if svc.model_router else [svc.model],
+                                     "default_model": svc.model_router.default if svc.model_router else svc.model})
+                elif not post and path == "/api/keys/usage":
+                    self._json(200, svc.key_store.usage_report(start, end, query.get("interval", ["day"])[0],
+                                                               query.get("key_id", [None])[0],
+                                                               query.get("group", ["key"])[0],
+                                                               query.get("timezone", ["Asia/Shanghai"])[0],
+                                                               svc.model_router.available() if svc.model_router else [svc.model]))
+                elif not post and len(parts) == 4 and parts[3] == "usage":
+                    self._json(200, svc.key_store.usage(parts[2], start, end))
+                elif post:
+                    req = json.loads(self._body() or b"{}")
+                    if not isinstance(req, dict):
+                        raise ValueError("请发送 JSON 对象")
+                    if path == "/api/keys":
+                        self._json(201, svc.key_store.create(req.get("name")))
+                    elif len(parts) == 4 and parts[3] == "model":
+                        model = req.get("model")
+                        available = svc.model_router.available() if svc.model_router else [svc.model]
+                        if model is not None and model not in available:
+                            raise ValueError("所选模型未安装或不可用")
+                        svc.key_store.set_model(parts[2], model)
+                        self._json(200, {"id": parts[2], "model": model})
+                    elif len(parts) == 4 and parts[3] in ("state", "delete"):
+                        state = "deleted" if parts[3] == "delete" else req.get("state")
+                        if parts[3] == "state" and state not in ("active", "disabled"):
+                            raise ValueError("state 应为 active 或 disabled")
+                        svc.key_store.change(parts[2], state)
+                        self._json(200, {"id": parts[2], "state": state})
+                    else:
+                        self._json(404, {"error": {"message": "not found"}})
+                else:
+                    self._json(404, {"error": {"message": "not found"}})
+            except KeyError:
+                self._json(404, {"error": {"message": "Key 不存在"}})
+            except ValueError as e:
+                self._json(400, {"error": {"message": str(e)}})
+            except StoreUnavailable as e:
+                self._json(503, {"error": {"message": str(e)}})
+
+        def _model_control(self, post=False):
+            if not host_allowed(self.headers.get("Host"), svc.host_names, "*" in svc.allowed_hosts) or self._foreign_origin():
+                self._json(403, {"error": {"message": "Model control is available only from Strata's own page"}})
+                return
+            if not post:
+                self._json(200, svc.model_state(), headers={"Cache-Control": "no-store"})
+                return
+            if svc.key_store is not None:
+                given = self._given_key()
+                if not given or not key_matches(given, [svc.admin_api_key]):
+                    self._json(403 if given else 401, {"error": {"message": "需要独立的管理员密钥，请先在 API Keys 登录"}})
+                    return
+            elif not self._authorized():
+                return
+            if not self._own_page("the model can be enabled or disabled"):
+                return
+            try:
+                body = json.loads(self._body() or b"{}")
+                if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
+                    raise ValueError("enabled must be a boolean")
+                self._json(200, svc.set_model_enabled(body["enabled"]))
+            except ValueError as e:
+                self._json(400, {"error": {"message": str(e)}})
+            except ModelBusy as e:
+                self._json(409, {"error": {"message": str(e)}})
+            except (EngineDied, EngineStuck, EngineStarting, GpuBusy, OSError) as e:
+                self._json(503, {"error": {"message": str(e)}})
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/model":
+                self._model_control()
+                return
+            if path == "/api/monitor/metrics" and svc.key_store is not None:
+                # The managed-key dashboard observes the whole service without a call credential.
+                # Keep the Host check here: keyed APIs skip it in parse_request.
+                if not host_allowed(self.headers.get("Host"), svc.host_names, "*" in svc.allowed_hosts) or \
+                        self._foreign_origin():
+                    self._json(403, {"error": {"message": "Monitor statistics are available only from Strata's own page"}})
+                    return
+                self._json(200, svc.metrics(all_requests=parse_qs(urlsplit(self.path).query).get("requests") == ["all"]),
+                           headers={"Cache-Control": "no-store"})
+                return
+            if path == "/api/keys" or path.startswith("/api/keys/"):
+                self._keys_api(path)
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -7106,7 +7429,7 @@ def make_handler(svc: Service):
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
-                                                          "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                                                          "loaded": svc.loaded(), "auto_load": svc.model_enabled and hasattr(svc.engine, "restart")})
                 return
             if path == "/settings":
                 if self._authorized():
@@ -7135,8 +7458,9 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 **({"key_management": True, "api_key": True} if svc.key_store is not None else {}),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "enabled": svc.model_enabled, "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -7166,6 +7490,24 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
+                    if svc.model_router:
+                        assigned = svc.key_store.model(self.key_id) or svc.model_router.default
+                        if assigned not in svc.model_router.available():
+                            self._json(503, {"error": {"type": "server_error", "message": "分配的模型不可用"}})
+                            return
+                        loaded = assigned == svc.model and svc.loaded() and svc.model_enabled
+                        model = {"id": assigned, "object": "model",
+                                 "status": {"value": "loaded" if loaded else "unloaded"}}
+                        if assigned == svc.model:
+                            model.update(meta={"n_ctx": svc.reported_ctx()},
+                                         architecture={"input_modalities": ["text", "image"] if svc.vision else ["text"],
+                                                       "output_modalities": ["text"]})
+                        data = [model] if svc.model_enabled else []
+                        if svc.images is not None:
+                            data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
+                                         "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
+                        self._json(200, {"object": "list", "data": data})
+                        return
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
@@ -7177,7 +7519,7 @@ def make_handler(svc: Service):
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    data = data if loaded else []
+                    data = data if loaded and svc.model_enabled else []
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
@@ -7212,15 +7554,97 @@ def make_handler(svc: Service):
 
         def do_POST(self):
             try:
-                self._post()
+                path = self.path.split("?")[0].rstrip("/")
+                path = V1_V1_ALIASES.get(path, path)
+                routed = ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/messages/count_tokens")
+                controlled = ("/api/model", "/load", "/unload", "/v1/load", "/v1/unload", "/v1/vram",
+                              "/v1/images/generations")
+                if svc.model_router and path in routed:
+                    if not self._authorized() or self._foreign_page():
+                        return
+                    assigned = None
+                    def target():
+                        nonlocal assigned
+                        if not self._authorized():
+                            return None
+                        assigned = svc.key_store.model(self.key_id) or svc.model_router.default
+                        return assigned
+                    with svc.model_router.access(target) as (admitted, error):
+                        if error is not None:
+                            self._json(503, {"error": {"type": "server_error", "message": str(error)}})
+                            return
+                        if not admitted:
+                            return
+                        if path != "/v1/messages/count_tokens":
+                            self.usage = svc.key_store.begin(self.key_id, path, assigned)
+                            svc.key_usage.current = self.usage
+                        self._post()
+                elif svc.model_router and (path in controlled or path.startswith("/slots/")):
+                    with svc.model_router.access():
+                        self._post()
+                else:
+                    self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except StoreUnavailable as e:
+                self._usage_failure(e)
+            except Exception:
+                if self.usage is not None:
+                    self.usage.error = True
+                raise
+            finally:
+                try:
+                    if self.usage is not None:
+                        self.usage.finish()
+                except StoreUnavailable as e:
+                    print(f"[strata] {e}", flush=True)
+                finally:
+                    svc.key_usage.current = None
+
+        def _usage_failure(self, error):
+            if self.usage is not None:
+                self.usage.error = True
+            body = {"error": {"type": "server_error", "message": str(error)}}
+            if not self.answer_started:
+                # The database may already have failed; do not recursively try to settle the same row.
+                usage, self.usage = self.usage, None
+                try:
+                    self._json(503, body)
+                finally:
+                    self.usage = usage
+            else:
+                try:
+                    path = self.path.split("?")[0].rstrip("/")
+                    if path == "/v1/messages":
+                        self.wfile.write(b"event: error\ndata: " + json.dumps({"type": "error", **body}).encode() + b"\n\n")
+                    elif path == "/v1/responses":
+                        self.wfile.write(b"event: error\ndata: " + json.dumps({"type": "error", "code": "server_error",
+                                         "message": str(error)}).encode() + b"\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps(body).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    pass
 
         def _post(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/model":
+                self._model_control(post=True)
+                return
+            if path == "/api/keys" or path.startswith("/api/keys/"):
+                self._keys_api(path, post=True)
+                return
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
+            if svc.key_store is not None and self.usage is None and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                self.usage = svc.key_store.begin(self.key_id, path, svc.model)
+                svc.key_usage.current = self.usage
+            if not svc.model_enabled and path in ("/load", "/v1/load", "/v1/chat/completions",
+                                                  "/v1/messages", "/v1/responses", "/v1/images/generations"):
+                self._json(503, {"error": {"type": "server_error", "code": "model_disabled",
+                                           "message": "模型已关闭，请先在控制台开启模型"}})
+                return
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path == "/settings":
@@ -7251,7 +7675,7 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineStarting) as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
@@ -7277,6 +7701,7 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                self.stream_usage = bool(req.get("stream"))
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -7449,7 +7874,7 @@ def make_handler(svc: Service):
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
-                     "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     "modalities": {"vision": svc.vision is not None}, "models_autoload": svc.model_enabled and hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
@@ -7595,9 +8020,28 @@ def make_handler(svc: Service):
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
+            if getattr(self, "usage", None) is not None and self.stream_usage:
+                items = self._accounted(items, api)
             if self.record is None:
                 return items
             return self._captured(items, api)
+
+        def _accounted(self, items, api):
+            try:
+                for item in items:
+                    terminal = False
+                    if item is not None:
+                        if api == "openai":
+                            terminal = bool(item.get("usage"))
+                        elif api == "responses":
+                            terminal = item.get("type") in ("response.completed", "response.incomplete")
+                        else:
+                            terminal = item[1].get("type") == "message_stop"
+                    if terminal:
+                        self.usage.finish()            # terminal stream event confirms durable settlement
+                    yield item
+            finally:
+                items.close()
 
         def _captured(self, items, api):
             try:
@@ -7979,6 +8423,9 @@ class Server(ThreadingHTTPServer):
         if tel is not None and hasattr(tel, "close"):
             tel.close()
         super().server_close()
+        store = getattr(getattr(self, "svc", None), "key_store", None)
+        if store is not None:
+            store.close()
 
 
 def warn_tight_ram(arena_mib) -> None:
@@ -8237,6 +8684,29 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
         return True
     name = host_name(rest)
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
+
+
+def configure_key_management(svc: Service, cfg: dict, config_path=None):
+    """Off by default. Existing configured keys are imported without reviving tombstones."""
+    if cfg.get("key_management") is not True:
+        return
+    admin = os.environ.get("STRATA_ADMIN_API_KEY", cfg.get("admin_api_key", ""))
+    if not isinstance(admin, str) or not admin.strip():
+        raise ValueError("key_management requires a separate admin_api_key or STRATA_ADMIN_API_KEY")
+    admin = admin.strip()
+    if admin in key_list(svc.api_key):
+        raise ValueError("admin_api_key must differ from every API call key")
+    config = Path(config_path).resolve() if config_path else None
+    path = cfg.get("api_keys_db")
+    if not path:
+        if config is None:
+            raise ValueError("key_management requires a config file or api_keys_db")
+        path = config.with_name(config.stem + ".keys.sqlite")
+    path = Path(path)
+    if not path.is_absolute():
+        path = (config.parent if config else ROOT) / path
+    svc.key_store = KeyStore(path, key_list(svc.api_key))
+    svc.admin_api_key = admin
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
@@ -9118,7 +9588,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if set(key_list(svc.api_key)) & set(key_list(svc.telemetry_key)):
         print("[strata] telemetry_read_key must differ from every inference API key", file=sys.stderr)
         return 2
-    if not svc.api_key and "api_key" in cfg and not no_key_chosen:             # #569: written, but empty: the server has none (a warning, not a stop)
+    try:
+        configure_key_management(svc, cfg, a.config)
+    except (ValueError, OSError, StoreUnavailable) as e:
+        print(f"[strata] {e}", file=sys.stderr)
+        return 2
+    if not svc.api_key and svc.key_store is None and "api_key" in cfg and not no_key_chosen:  # #569: explicitly empty
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
@@ -9229,6 +9704,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    model_configs = cfg.get("key_model_configs")
+    if model_configs is not None:
+        if svc.key_store is None or not isinstance(model_configs, dict) or not all(
+                isinstance(k, str) and k and isinstance(v, str) and v for k, v in model_configs.items()) \
+                or svc.model in model_configs:
+            raise SystemExit('[strata] key_model_configs requires key management and a model-name to config-path map')
+        base = Path(a.config).resolve().parent
+        svc.model_router = KeyModelRouter(svc, {name: str((base / path).resolve())
+                                                for name, path in model_configs.items()})
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
@@ -9246,7 +9730,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if not ips:
             address = "[<this PC's IPv6 address>]" if a.host == "::" else "<this PC's IP address>"
             print(f"       from other devices: http://{address}:{bound_port}/", flush=True)
-        if not svc.api_key:
+        if not svc.api_key and svc.key_store is None:
             print("       WARNING: " + open_server_warning(bound_port, tools=svc.mcp is not None),
                   flush=True)
         if os.name == "nt":
@@ -9303,7 +9787,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 print(f"[strata] drain deadline expired; cancelling {cancelled} owned request(s) ...", flush=True)
                 svc.wait_for_drain(5)
                 drained = False
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        active_engine = svc.engine if svc.model_router else engine
+        active_vision = svc.vision if svc.model_router else vision
+        closers = [httpd.shutdown, getattr(active_engine, "close", None), active_vision.shutdown if active_vision else None,
                    hub.close if hub is not None else None]
         try:
             for close in filter(None, closers):

@@ -344,6 +344,18 @@ By default the model stays loaded until you close Strata. Three server options, 
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | A command run before the model is loaded again, for example one that unloads another server's model. |
 | | `"before_load_timeout_s": 120` | How long that command may run. When it fails or times out, the free VRAM decides: with `min_free_vram_mib` set and not enough free, the request gets **503** with `Retry-After`; otherwise the model loads with a warning. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads. |
 
+The console header's model switch uses `GET /api/model` and
+`POST /api/model` with `{"enabled": false}` or `{"enabled": true}` (JSON).
+Disabling stops the engine and vision encoder, releasing their model allocations, and blocks generation and
+explicit load requests with HTTP **503**, code `model_disabled`. Requests cannot reload a disabled model.
+Enabling loads the model immediately; the switch reports success only after loading finishes.
+A running or queued request returns **409**; wait for it to finish and retry the switch.
+If unloading fails, admission remains disabled and the switch can be retried. If enabling fails, a disabled model
+stays disabled. The switch is in memory for this server run; starting the server restores the configured startup behavior.
+With key management enabled, switching requires the independent administrator key (log in under API Keys first);
+otherwise it uses the server's API key when configured. Foreign web origins cannot operate the switch.
+The control server and its tokenizer remain available while the model is disabled.
+
 `POST /unload` unloads now (`409` while a request is running; `?wait=1` waits for the running turn, up to 300 s, or
 `?wait=<seconds>`). `POST /load` loads ahead of a request. Both need `Content-Type: application/json`:
 
@@ -810,6 +822,108 @@ language for one visit.
 Tests: `serve/test_web_*.py` and `serve/test_web_*.js` (Node), and a browser run against a stand-in server with no model:
 `WEBTEST_MODULES=<folder with puppeteer-core> node tools/webtest/browser_test.mjs`. `tools/webtest/shots.mjs` takes the page's
 screenshots.
+
+### API Key management and durable usage
+
+Off by default. Set these keys in the model's run config and restart the server:
+
+```json
+{
+  "key_management": true,
+  "admin_api_key": "a-separate-long-random-admin-secret"
+}
+```
+
+Open `/#keys` and sign in with that administrator secret. `STRATA_ADMIN_API_KEY`, when present, overrides
+`admin_api_key`. It must be nonempty and different from every configured call key. The administrator credential
+only opens the key-management APIs; use a call key for inference. The browser keeps the administrator credential
+in this tab's session storage and removes it on logout. The existing Chat credential remains separate.
+
+Create a named call key, copy it once, disable or enable it, or delete it. A new key has 32 random bytes; only
+its SHA-256 digest and a masked preview are stored. Deletion is permanent revocation, with history retained and
+hidden from the default list. Disabling or deleting affects new requests; accepted requests continue and settle.
+Existing keys from `api_key`, `--api-key` or `STRATA_API_KEY` are imported on startup. The database decides whether
+they are active: an old config entry cannot bypass revocation or reactivate a disabled/deleted key after restart.
+Other API permissions remain as before; this is not a quota or rate-limiting feature.
+
+To assign installed models to keys, add `"key_model_configs": {"model-id": "strata-other.json"}` to the
+primary run config. Paths are relative to that config. The model ID must match the other config's `model_name`.
+Only configs that exist are offered in API Keys; an existing key defaults to the primary model. An administrator
+can change a key's model in the table, and that key's chat, Responses and Messages requests use the selected model
+regardless of the model name in the request. `/v1/models` lists the key's assigned model. Models are loaded on demand:
+requests for the same model can use its parallel slots. Switching waits for the current model's requests to finish
+before unloading it; requests arriving behind a switch wait their turn.
+Switching can take minutes and discards the previous engine's in-memory prompt cache. Image generation is not routed
+by this setting. A missing assigned model fails the request rather than silently using a different model.
+
+With key management enabled, the Monitor tab reads `GET /api/monitor/metrics` without a call key or admin
+credential. It shows hardware, live work and request timings across **all call keys** since this server started;
+the recent-request list retains up to 500 engine runs in memory. This read-only endpoint contains no prompts,
+answers or credentials. Anyone who can reach Strata under its configured host names or IP addresses can read
+these statistics; foreign browser origins are refused and responses are not cached. The existing `/metrics`
+and Prometheus endpoints still require a call key. Chat calls still require a call key, and API Keys management
+still requires the separate admin credential. The durable per-key usage remains in API Keys.
+
+The **Usage** tab (`/#usage`) uses the same administrator session as API Keys. It shows requests, input,
+cached input and output tokens. The key selector and detail table show current keys, including disabled keys,
+and hide deleted keys. Key labels show names only, without credential previews. Retained historical usage
+still contributes to totals and model charts. Select a date range and a key, switch
+between Beijing time and UTC, or group the overview chart by key or API path. The lower request and token
+charts always show one pair per model, including available models with no usage. Both charts follow the
+selected dates and API Key. Each new request stores its admitted model; changing a key's model later does
+not reassign earlier usage. Older records without a model are kept in a separate **History (model not recorded)**
+group, rather than attributed to the current model. Single-day views use hourly buckets;
+longer ranges use daily buckets. The page refreshes every 10 seconds. **Export** downloads a CSV with each
+key's time buckets and request outcomes for the selected range. Hover over any chart to see the selected
+date or hour, its total and the matching key, request or token breakdown. The tooltip follows the pointer;
+token details separate cached input, uncached input and output.
+The lifetime total always covers all keys
+and dates. This local service has no billing data; the page does not assign prices or report a balance.
+
+SQLite stores credentials and individual usage records beside the config as `<config-stem>.keys.sqlite`.
+`api_keys_db` selects another path (relative paths are resolved beside the config). WAL and full synchronous
+transactions are enabled. Keep the database on a local disk. Use SQLite's backup API for a running server, or
+stop the server before copying the database; do not copy just the main file while WAL writes are active.
+No prompts, response bodies, headers, or plaintext credentials are stored. The admin secret stays in the config
+or environment and is never returned by `GET /config` or the key APIs. Database errors refuse new authenticated
+requests with 503; repair the disk/database and restart, rather than continuing with unrecorded usage.
+
+Usage counts authenticated HTTP calls to `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`, including
+invalid bodies, failures, and disconnects. Authentication failures, metadata, token-count-only calls, and admin
+operations do not count. Each HTTP call counts once: streaming and thinking continuations do not add requests;
+MCP model rounds add their input/output work to that same request. Input includes cached tokens (also shown
+separately); output includes thinking and tool-call tokens. Total is input plus output, without adding cached
+tokens a second time. Successful, failed, interrupted, and running counts are shown separately.
+
+Records are committed on admission, each completed model round, and settlement; this does not depend on
+`api_monitor`. On restart, unfinished records become interrupted and visibly incomplete: already committed
+tokens remain, but work lost during a process crash cannot be reconstructed. Existing in-memory Monitor history
+has no key attribution and is not imported. UTC timestamps are grouped into Beijing dates (UTC+8); both dates
+in a selected range are inclusive. Deleted keys' usage is retained without automatic expiry.
+
+Admin endpoints (Bearer or `x-api-key` with the separate administrator secret):
+
+| Endpoint | Operation |
+| --- | --- |
+| `GET /api/keys` | List keys and usage; `include_deleted=true` includes deleted keys |
+| `POST /api/keys` | Create with `{"name":"Laptop"}`; the response contains the new key once |
+| `POST /api/keys/<id>/state` | Set `{"state":"active"}` or `{"state":"disabled"}` |
+| `POST /api/keys/<id>/delete` | Send `{}` to revoke permanently, retaining history |
+| `GET /api/keys/<id>/usage` | Selected-range summary, lifetime summary, and daily rows |
+| `GET /api/keys/usage` | Dashboard totals, time series and groups; includes deleted keys |
+
+All GET endpoints accept `from=YYYY-MM-DD&to=YYYY-MM-DD`. The dashboard endpoint also accepts `key_id`,
+`interval=day|hour`, `group=key|path` and `timezone=Asia/Shanghai|UTC`; defaults are day, key and Asia/Shanghai.
+Its `usage`, `series`, `groups` and `model_groups` follow the selected dates and key. `model_groups` remains
+grouped by model regardless of `group`; each item has `id`, `name`, `usage` and `series`, with a null ID for
+older records without a stored model. `keys` lists each key's date-range totals,
+and `lifetime` covers the whole database. Empty time buckets are omitted from the API and drawn as zero in the page.
+Management routes return 404 while disabled,
+401 without an administrator credential, 403 for other credentials or a foreign Origin, and 400 for invalid
+names, states or date ranges. Writes require `application/json`. No cross-origin access is granted, including
+origins in `cors_origins`; the existing trusted reverse-proxy origins still work. These settings cannot be
+edited by `POST /config`. Turning the feature off restores the legacy static-key configuration, so revoke old
+keys there as well before intentionally disabling management.
 
 ### API request monitor
 

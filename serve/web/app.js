@@ -74,15 +74,22 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  const previousTab = tab;
+  tab = ["chat", "images", "monitor", "api", "about", "keys", "usage"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "api", "about", "keys", "usage"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
-  if (tab === "monitor") loadMcp();
+  if (tab === "monitor" || (["keys", "usage"].includes(previousTab) && tab === "chat")) loadMcp();
+  if (tab === "api") showApiGuide();
   if (tab === "about") loadConfig();
-  if (lastMetrics) render(lastMetrics);
+  if (tab === "keys") { setPill("idle", "Key 管理"); document.dispatchEvent(new Event("strata-keys-view")); }
+  else if (tab === "usage") {
+    setPill("idle", "用量信息"); $("tab-btn-usage").scrollIntoView({block: "nearest", inline: "nearest"});
+    document.dispatchEvent(new Event("strata-usage-view"));
+  }
+  else if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
@@ -108,6 +115,7 @@ $("api-key").oninput = () => saveApiKey();
 $("api-key").onchange = () => saveApiKey(true);
 
 let health = {model: "strata", images: false, max_context: 0};
+let healthReady;
 // the texts that depend on what this server offers: the empty chat's line and the attach button's hint
 function renderEmptyChat() {
   $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
@@ -119,15 +127,169 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
+    $("tab-btn-keys").hidden = !health.key_management;
+    $("tab-btn-usage").hidden = !health.key_management;
+    $("monitor-scope").hidden = !health.key_management;
+    $("api-managed-note").hidden = !health.key_management;
+    if (tab === "keys" && health.key_management) $("tab-btn-keys").parentElement.scrollLeft = $("tab-btn-keys").parentElement.scrollWidth;
+    if (tab === "usage" && health.key_management) $("tab-btn-usage").scrollIntoView({block: "nearest", inline: "nearest"});
+    document.dispatchEvent(new Event("strata-health"));
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
 }
 
+// ------------------------------------------------------------------ API guide
+function apiExamples(model) {
+  const base = location.origin;
+  const id = model || "YOUR_MODEL_NAME";
+  const ps = (value) => "'" + value.replace(/'/g, "''") + "'";
+  const body = [
+    "$body = @{",
+    "    model = " + ps(id),
+    "    messages = @(@{ role = 'user'; content = 'Hello!' })",
+    "    max_tokens = 256",
+    "} | ConvertTo-Json -Depth 5",
+  ].join("\n");
+  $("api-example-python").textContent = [
+    "# pip install openai",
+    "from openai import OpenAI",
+    "",
+    "client = OpenAI(base_url=" + JSON.stringify(base + "/v1") + ", api_key=\"YOUR_API_KEY\")",
+    "response = client.chat.completions.create(",
+    "    model=" + JSON.stringify(id) + ",",
+    "    messages=[{\"role\": \"user\", \"content\": \"Hello!\"}],",
+    "    max_tokens=256,",
+    ")",
+    "print(response.choices[0].message.content)",
+  ].join("\n");
+  $("api-example-openai").textContent = [
+    "$headers = @{ Authorization = 'Bearer YOUR_API_KEY' }",
+    body,
+    "Invoke-RestMethod -Method Post -Uri " + ps(base + "/v1/chat/completions") +
+      " -ContentType 'application/json' -Headers $headers -Body $body",
+  ].join("\n");
+  $("api-example-anthropic").textContent = [
+    "$headers = @{ 'x-api-key' = 'YOUR_API_KEY'; 'anthropic-version' = '2023-06-01' }",
+    body,
+    "Invoke-RestMethod -Method Post -Uri " + ps(base + "/v1/messages") +
+      " -ContentType 'application/json' -Headers $headers -Body $body",
+  ].join("\n");
+}
+
+let apiModelsRequest = 0;
+async function loadApiModels() {
+  const request = ++apiModelsRequest;
+  const list = $("api-models"), status = $("api-model-status");
+  list.replaceChildren();
+  status.textContent = "正在获取模型列表…";
+  status.dataset.error = "false";
+  apiExamples(null);
+  try {
+    const response = await fetch("v1/models", {cache: "no-store", headers: headers()});
+    const data = await response.json();
+    if (!response.ok) throw new Error(response.status === 401
+      ? "调用 Key 缺失或错误，请输入有效的调用 Key。"
+      : data.error?.message || "HTTP " + response.status);
+    if (request !== apiModelsRequest) return;
+    const models = data.data;
+    list.innerHTML = models.map((model) => {
+      const outputs = model.architecture?.output_modalities;
+      const kind = outputs?.includes("image") && !outputs.includes("text") ? "图像生成" : "对话";
+      const state = {loaded: "已加载", unloaded: "按需加载"}[model.status?.value] || "";
+      const details = [kind, state, model.alias_of ? "别名：" + model.alias_of : ""].filter(Boolean).join(" · ");
+      return '<li><div><code>' + esc(model.id) + '</code><span class="muted small">' + esc(details) +
+        '</span></div><button class="st-btn st-btn--icon" type="button" data-copy="' + esc(model.id) +
+        '" aria-label="复制模型名称">' + icon("copy") + "</button></li>";
+    }).join("");
+    const chat = models.find((model) => !model.architecture?.output_modalities ||
+      model.architecture.output_modalities.includes("text"));
+    apiExamples(chat?.id);
+    status.textContent = models.length ? (chat ? "" : "当前没有对话模型，示例中的模型名称需要自行替换。")
+      : "当前没有可用模型，请检查模型是否开启后刷新。";
+  } catch (error) {
+    if (request !== apiModelsRequest) return;
+    status.dataset.error = "true";
+    status.textContent = "无法获取模型列表：" + error.message;
+  }
+}
+
+function showApiGuide() {
+  $("tab-btn-api").scrollIntoView({block: "nearest", inline: "nearest"});
+  $("api-call-key").value = store.get("apikey", "");
+  $("api-managed-note").hidden = !health.key_management;
+  facts($("api-addresses"), [
+    ["OpenAI Base URL", location.origin + "/v1", true],
+    ["Anthropic Base URL", location.origin, true],
+    ["模型列表", location.origin + "/v1/models", true],
+  ]);
+  loadApiModels();
+}
+$("api-key-form").onsubmit = (event) => {
+  event.preventDefault();
+  const key = $("api-call-key").value.trim();
+  store.set("apikey", key);
+  $("api-key").value = key;
+  loadApiModels();
+};
+for (const button of document.querySelectorAll("[data-api-copy]")) {
+  button.onclick = () => copyText($(button.dataset.apiCopy).textContent, button);
+}
+
+// The explicit switch is independent of idle unloading: disabled models never autoload.
+let modelControl = null, modelSwitchBusy = false;
+function renderModelControl(state) {
+  modelControl = state;
+  const button = $("model-toggle");
+  const previousText = button.textContent;
+  button.setAttribute("aria-checked", String(state.enabled));
+  button.disabled = modelSwitchBusy || !state.supported;
+  button.textContent = modelSwitchBusy ? "正在切换…" : !state.enabled ? "模型已关闭 · 开启" : state.loaded ? "模型已开启 · 关闭" : "模型待加载 · 关闭";
+  if (tab === "api" && button.textContent !== previousText) $("tab-btn-api").scrollIntoView({block: "nearest", inline: "nearest"});
+  button.title = state.enabled ? "关闭并释放模型显存和内存；忙碌时请稍后重试" : "开启并自动加载模型";
+}
+async function pollModelControl() {
+  try {
+    const response = await fetch("api/model", {cache: "no-store"});
+    if (response.ok && !modelSwitchBusy) renderModelControl(await response.json());
+  } catch (_) {}
+  setTimeout(pollModelControl, 2000);
+}
+$("model-toggle").onclick = async () => {
+  if (!modelControl || modelSwitchBusy) return;
+  const enabled = !modelControl.enabled;
+  modelSwitchBusy = true;
+  renderModelControl(modelControl);
+  try {
+    const h = headers(true);
+    if (health.key_management) {
+      const admin = sessionStorage.getItem("strata.keys.admin") || "";
+      if (!admin) throw new Error("请先在 API Keys 页面使用管理员密钥登录，再操作模型开关。");
+      h.Authorization = `Bearer ${admin}`;
+    }
+    const response = await fetch("api/model", {method: "POST", headers: h, body: JSON.stringify({enabled})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(response.status === 409 ? "模型正在处理请求，请等待请求完成后重试。" : result.error?.message || `HTTP ${response.status}`);
+    modelControl = result;
+    toast("success", enabled ? "模型已开启" : "模型已关闭", enabled ? "模型加载完成，可以调用 API。" : "模型已卸载，API 调用已禁止。");
+  } catch (error) {
+    toast("warn", "模型切换失败", error.message);
+  } finally {
+    modelSwitchBusy = false;
+    // Re-read after failures too: an unload failure leaves API admission disabled.
+    try {
+      const response = await fetch("api/model", {cache: "no-store"});
+      if (response.ok) modelControl = await response.json();
+    } catch (_) {}
+    renderModelControl(modelControl);
+  }
+};
+pollModelControl();
+
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
+  {key: "speed", label: "Total generation throughput", icon: "gauge", unit: "t/s", series: "tok_s"},
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
@@ -140,7 +302,7 @@ $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
+      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">All active requests</span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
     </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
@@ -172,6 +334,7 @@ let metricsEpoch = 0;
 // After Load or Unload returns, a poll that started earlier can still say the opposite. Hold the POST's state until a later
 // poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
 let metricsHold = null;
+let selectedRequestId = null;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 function metricsAgree(live, state) {
   const s = (live && live.state) || "";
@@ -179,9 +342,13 @@ function metricsAgree(live, state) {
   return s !== "" && s !== "unloaded";
 }
 async function poll() {
+  if (tab === "keys" || tab === "usage") { setTimeout(poll, 1000); return; }
   const epoch = ++metricsEpoch;
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    await healthReady;
+    const endpoint = health.key_management ? "api/monitor/metrics" : "metrics";
+    const r = await fetch(endpoint + (reqShowAll ? "?requests=all" : ""),
+                          {cache: "no-store", headers: health.key_management ? {} : headers()});
     if (r.status === 401) {
       setPill("error", tr("pill.keyNeeded", "API key needed"));
       if (!keyWarned) { keyWarned = true; toast("warn", tr("pill.keyNeeded", "API key needed"), tr("toast.keyAbout", "This server needs a key: add it under About > Settings."), 6000); }
@@ -350,6 +517,8 @@ function render(m) {
     setPill("idle", tr("model.loading", "Loading…"));
   } else if (modelOp === "unload") {
     setPill("idle", tr("model.unloading", "Unloading…"));
+  } else if (m.model_control && !m.model_control.enabled) {
+    setPill("idle", "模型已关闭");
   } else if (localLoad) {
     setPill("idle", tr("model.loading", "Loading…"));
   } else if (imageLive(live)) {
@@ -413,66 +582,98 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+function renderActiveRequests(active) {
+  if (!active.some((r) => r.id === selectedRequestId)) {
+    selectedRequestId = active.reduce((first, r) => !first || r.elapsed_s > first.elapsed_s ? r : first, null)?.id ?? null;
+  }
+  const body = $("active-body");
+  const rows = new Map(Array.from(body.children, (row) => [row.dataset.id, row]));
+  for (const r of active) {
+    let row = rows.get(r.id);
+    if (row) rows.delete(r.id);
+    else {
+      row = document.createElement("tr");
+      row.dataset.id = r.id;
+      row.innerHTML = `<td><button type="button" class="st-btn st-btn--secondary active-request"></button></td><td></td>
+        <td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td>`;
+      row.querySelector("button").addEventListener("click", () => {
+        selectedRequestId = r.id;
+        if (lastMetrics) render(lastMetrics);
+      });
+      body.appendChild(row);
+    }
+    const button = row.querySelector("button");
+    button.textContent = r.id;
+    button.setAttribute("aria-pressed", String(r.id === selectedRequestId));
+    const running = r.state === "reading" || r.state === "generating";
+    const cells = row.children;
+    cells[1].textContent = r.state[0].toUpperCase() + r.state.slice(1);
+    cells[2].textContent = fmt(r.prompt_tokens);
+    cells[3].textContent = running ? `${fmt(r.generated)} / ${fmt(r.max_tokens)}` : "–";
+    cells[4].textContent = running && r.prompt_tokens != null && r.generated != null && r.max_context != null
+      ? `${fmt(r.prompt_tokens + r.generated)} / ${fmt(r.max_context)}` : "–";
+    cells[5].textContent = r.tok_s == null ? "–" : `${fmt(r.tok_s, 1)} t/s`;
+    cells[6].textContent = r.elapsed_s == null ? "–" : `${fmt(r.elapsed_s, 1)} s`;
+  }
+  for (const row of rows.values()) row.remove();
+  $("active-empty").hidden = active.length > 0;
+  $("active-wrap").hidden = active.length === 0;
+  return active.find((r) => r.id === selectedRequestId) || null;
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  // A local turn keeps metrics on "unloaded" for the whole engine start.
+  const active = live.requests || [];
+  const selected = renderActiveRequests(active);
+  $("state-request").textContent = selected ? `Request ${selected.id}` : last ? "Last completed request" : "No active request";
   const imageNow = imageLive(live);
   const starting = modelOp === "load" || imageNow || (busy != null && live.state === "unloaded");
-  const on = !modelOp && live.queued > 0 ? "queued" : live.state;
+  const on = selected ? (selected.state === "waiting" ? "queued" : selected.state) : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) {
-    const lit = (b.dataset.s === on || b.dataset.s === live.state) && !(starting && b.dataset.s === "unloaded");
-    b.classList.toggle("on", lit);
+    b.classList.toggle("on", b.dataset.s === on && !(starting && b.dataset.s === "unloaded"));
   }
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
-  if (modelOp === "load" || (busy != null && live.state === "unloaded" && !imageNow)) {
+  delete prog.dataset.tone;
+  if (selected) {
+    if (selected.state === "queued" || selected.state === "waiting") {
+      label = selected.state === "queued" ? "Queued" : "Waiting";
+      detail = "Waiting to run";
+    } else if (selected.state === "reading") {
+      label = "Reading prompt";
+      prog.dataset.tone = "info";
+      detail = `${fmt(selected.prompt_tokens)} input tokens`;
+    } else {
+      label = "Generating";
+      pct = selected.max_tokens ? Math.min(100, (100 * selected.generated) / selected.max_tokens) : 0;
+      detail = `${fmt(selected.generated)} / ${fmt(selected.max_tokens)} output token limit · ${fmt(selected.tok_s, 1)} tok/s`;
+    }
+  } else if (modelOp === "load" || (busy != null && live.state === "unloaded" && !imageNow)) {
     label = "Loading";
-    delete prog.dataset.tone;
     detail = "The model is loading.";
-  } else if (imageNow && (live.state === "unloaded" || live.state === "reading" || live.state === "generating" || live.state === "idle")) {
+  } else if (imageNow) {
     label = live.state === "unloaded" ? "Loading" : "Generating image";
-    delete prog.dataset.tone;
     detail = live.state === "unloaded" ? "The model is loading." : "An image is generating. It finishes on its own.";
   } else if (modelOp === "unload") {
     label = "Unloading";
-    delete prog.dataset.tone;
     detail = "Freeing the GPU.";
-  } else if (live.state === "reading") {
-    label = "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
-    }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
-    delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
   } else if (live.state === "unloaded") {
     label = "Unloaded";
-    delete prog.dataset.tone;
     detail = "Load brings it back. A message does too.";
   } else if (last) {
-    delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+  const speed = active.reduce((sum, r) => sum + (r.tok_s || 0), 0);
+  setMetric("speed", fmt(speed, 1), "t/s", "All active requests now");
+  const prefill = !selected && last && last.prompt_ms > 0
+    ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+            selected ? "Prefill per request unavailable" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
-  spark("sp-prefill", h.prefill_tok_s_mean);
+  spark("sp-prefill", selected ? [] : h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
@@ -504,16 +705,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  // Context belongs to the selected request; queued requests have not started.
+  const running = selected && (selected.state === "reading" || selected.state === "generating");
+  const ctx = selected ? (running ? selected.max_context : null) : last ? eng.max_context : null;
+  const used = running && selected.prompt_tokens != null && selected.generated != null
+    ? selected.prompt_tokens + selected.generated
+    : !selected && last && last.prompt_tokens != null && last.output_tokens != null
+      ? last.prompt_tokens + last.output_tokens : null;
+  const frac = ctx && used != null ? Math.min(1, used / ctx) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";
+  $("ctx-pct").textContent = ctx && used != null ? `${Math.round(frac * 100)}%` : "–";
+  $("ctx-sub").textContent = ctx && used != null ? `${kfmt(used)} / ${ctxfmt(ctx)}` : selected && !running ? "Not running" : "–";
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
@@ -603,6 +806,8 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 // "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
 let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
 async function loadMcp() {
+  await healthReady;
+  if (tab === "keys" || tab === "usage" || (health.key_management && !store.get("apikey", ""))) return;
   try {
     const r = await fetch("mcp", {headers: headers()});
     if (!r.ok) return;
@@ -1571,7 +1776,8 @@ async function start() {
   renderChat();
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-  loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  healthReady = loadHealth();
+  healthReady.then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
   poll();
   requestAnimationFrame(fitHeader);

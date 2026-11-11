@@ -27,10 +27,15 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-api" aria-controls="view-api" aria-selected="false" data-tab="api">API 指南</button>
+    <button class="st-tab" role="tab" id="tab-btn-keys" aria-controls="view-keys" aria-selected="false" data-tab="keys" hidden>API Keys</button>
+    <button class="st-tab" role="tab" id="tab-btn-usage" aria-controls="view-usage" aria-selected="false" data-tab="usage" hidden>用量</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span></button>
   </nav>
   <span class="st-header__spacer"></span>
+  <button class="st-btn st-btn--secondary" id="model-toggle" role="switch" aria-checked="true"
+    aria-label="启用模型" disabled title="关闭后卸载模型并禁止 API 调用">连接模型…</button>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
     <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
   <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
@@ -116,9 +121,10 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
+      <p id="monitor-scope" class="muted small" hidden>All API keys · statistics since this server started. No API key is needed to view this monitor.</p>
       <div class="st-card state-card">
         <div class="state-card__head">
-          <span class="card-title">Model state</span>
+          <span class="card-title">Selected request state</span><span class="muted small" id="state-request">No active request</span>
           <span class="badges" id="state-badges">
             <span class="st-badge" data-s="idle">Idle</span>
             <span class="st-badge" data-s="unloaded">Unloaded</span>
@@ -132,6 +138,18 @@
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 
+      <div class="st-card req-card">
+        <div class="req-head"><span class="card-title">Active requests</span><span class="muted small">Select a request to inspect it</span></div>
+        <div class="table-wrap" id="active-wrap">
+          <table class="st-table">
+            <thead><tr><th>Request ID</th><th>Status</th><th class="num">Input</th><th class="num">Output / limit</th><th class="num">Context / limit</th><th class="num">Speed</th><th class="num">Elapsed</th></tr></thead>
+            <tbody id="active-body"></tbody>
+          </table>
+        </div>
+        <p class="muted small active-empty" id="active-empty">No active requests</p>
+      </div>
+
+      <p class="muted small hardware-note">Hardware metrics are shared across all requests.</p>
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
@@ -139,6 +157,7 @@
       <div class="monitor-row">
         <div class="st-card ctx-card">
           <span class="card-title">Context fill</span>
+          <span class="muted small">Input + output tokens / context limit</span>
           <div class="ctx-gauge">
             <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
               <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
@@ -187,6 +206,149 @@
         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Sampling).</p>
       </div>
+    </div>
+  </section>
+
+  <section class="view view--keys" id="view-keys" role="tabpanel" aria-labelledby="tab-btn-keys" lang="zh-CN" hidden>
+    <div class="keys-page">
+      <div class="keys-heading"><div><h1>API Key 管理</h1><p class="muted">为不同应用分配独立密钥，查看持久保存的调用用量。</p></div>
+        <button class="st-btn st-btn--secondary" id="keys-logout" hidden>退出管理</button></div>
+      <p id="keys-message" class="keys-message" role="status" aria-live="polite"></p>
+      <form class="st-card keys-login" id="keys-login">
+        <h2>管理员登录</h2><p class="muted">使用独立管理员密钥，普通调用 Key 无法进入。凭证仅保留在当前标签页，退出时清除。</p>
+        <label class="st-label" for="keys-admin">管理员密钥</label>
+        <div class="keys-inline"><input class="st-input" id="keys-admin" type="password" autocomplete="off" required>
+          <button class="st-btn st-btn--primary" type="submit">进入管理</button></div>
+      </form>
+      <div id="keys-workspace" hidden>
+        <div class="st-card keys-toolbar">
+          <form id="keys-create" class="keys-inline"><label class="st-label" for="keys-name">创建 Key</label>
+            <input class="st-input" id="keys-name" placeholder="名称，例如：手机、办公电脑" maxlength="128" required>
+            <button class="st-btn st-btn--primary" type="submit">创建 Key</button></form>
+          <div class="keys-filters"><label class="st-label" for="keys-range">统计范围</label>
+            <select class="st-input" id="keys-range"><option value="all">累计用量</option><option value="today">今天</option>
+              <option value="7">最近 7 天</option><option value="30">最近 30 天</option><option value="custom">自定义日期</option></select>
+            <div class="keys-inline" id="keys-dates" hidden><label for="keys-from">从</label><input class="st-input" id="keys-from" type="date">
+              <label for="keys-to">至</label><input class="st-input" id="keys-to" type="date"></div>
+            <label class="keys-check"><input type="checkbox" id="keys-deleted"> 显示已删除 Key</label>
+            <button class="st-btn st-btn--secondary" id="keys-refresh" type="button">刷新</button></div>
+          <p class="muted small">日期按北京时间（UTC+8）计算。请求次数包含成功、失败和中断；健康检查等访问不计入。</p>
+        </div>
+        <div class="keys-summary" id="keys-summary"></div>
+        <div class="st-card keys-table-card"><div class="keys-heading"><h2>密钥列表</h2><span id="keys-count" class="muted small"></span></div>
+          <div class="table-wrap"><table class="st-table keys-table"><thead><tr><th>名称 / 标识</th><th>状态</th><th>模型</th><th>创建 / 最近调用</th>
+            <th class="num">请求次数</th><th class="num">输入 Token</th><th class="num">输出 Token</th><th class="num">总 Token</th><th>操作</th></tr></thead>
+            <tbody id="keys-rows"></tbody></table></div><p id="keys-empty" class="muted" hidden>暂无 Key，创建一个后即可分配给应用使用。</p>
+        </div>
+        <div class="st-card keys-detail" id="keys-detail" hidden><div class="keys-heading"><h2 id="keys-detail-title">每日用量</h2>
+          <button class="st-btn st-btn--secondary" id="keys-detail-close">关闭详情</button></div><p id="keys-detail-summary" class="muted"></p>
+          <div class="table-wrap"><table class="st-table"><thead><tr><th>日期（北京）</th><th>请求</th><th>成功</th><th>失败</th><th>中断</th><th>进行中</th>
+            <th>输入</th><th>缓存输入</th><th>输出</th><th>总 Token</th><th>未完整结算</th></tr></thead><tbody id="keys-daily"></tbody></table></div>
+        </div>
+        <p class="muted small">模型按 Key 分配；切换模型需等待正在处理的请求结束并重新加载。输入 Token 包含缓存部分；删除 Key 后保留历史用量。</p>
+      </div>
+    </div>
+    <dialog class="keys-dialog" id="keys-secret"><h2>Key 已创建</h2><p>完整密钥仅展示这一次，请复制并妥善保存。关闭后无法再次查看。</p>
+      <label class="st-label" for="keys-secret-value">新 API Key</label><textarea class="st-input" id="keys-secret-value" readonly rows="2"></textarea>
+      <p id="keys-copy-status" class="muted" role="status"></p><div class="keys-inline"><button class="st-btn st-btn--primary" id="keys-copy">复制密钥</button>
+        <button class="st-btn st-btn--secondary" id="keys-secret-close">已保存，关闭</button></div></dialog>
+    <dialog class="keys-dialog" id="keys-confirm"><h2>删除 Key</h2><p id="keys-confirm-text"></p><p class="muted">删除后新请求立即失效，历史用量仍会保留；已经接收的请求继续结算。</p>
+      <div class="keys-inline"><button class="st-btn st-btn--secondary" id="keys-confirm-cancel">取消</button>
+        <button class="st-btn st-btn--primary" id="keys-confirm-delete">确认删除</button></div></dialog>
+  </section>
+
+  <!-- ============================ API guide ============================ -->
+  <section class="view view--usage" id="view-usage" role="tabpanel" aria-labelledby="tab-btn-usage" lang="zh-CN" hidden>
+    <div class="usage-page">
+      <div class="usage-heading"><h1>用量信息</h1><button class="usage-button usage-button--subtle" id="usage-logout" hidden>退出管理</button></div>
+      <p class="usage-note" id="usage-zone-note">所有日期均按 GMT+8 时间显示。统计本服务的 API 调用，数据每 10 秒刷新。</p>
+      <p id="usage-message" class="keys-message" role="status" aria-live="polite"></p>
+      <form class="st-card keys-login" id="usage-login">
+        <h2>管理员登录</h2><p class="muted">与 API Keys 共用当前标签页的管理会话。普通调用 Key 无法查看其他 Key 的用量。</p>
+        <label class="st-label" for="usage-admin">管理员密钥</label><div class="keys-inline">
+          <input class="st-input" id="usage-admin" type="password" autocomplete="off" required>
+          <button class="st-btn st-btn--primary" type="submit">查看用量</button></div>
+      </form>
+      <div id="usage-workspace" hidden>
+        <div class="usage-account">
+          <div class="usage-card"><span>本地服务</span><strong>未计费 <small>本地推理</small></strong><p>未设置价格，不统计充值余额或消费金额。</p></div>
+          <div class="usage-card"><span>累计 Tokens</span><strong id="usage-lifetime">–</strong><p>全部 API Key 的历史用量，包含已删除的 Key。</p></div>
+        </div>
+        <div class="usage-toolbar">
+          <label class="usage-filter">时间维度 <select id="usage-range" aria-label="时间维度">
+            <option value="today">今天</option><option value="yesterday">昨天</option><option value="7">近 7 天</option>
+            <option value="30" selected>近 30 天</option><option value="month">本月</option><option value="last-month">上月</option><option value="custom">自定义</option>
+          </select></label>
+          <label class="usage-filter">API Key <select id="usage-key" aria-label="API Key"><option value="">全部</option></select></label>
+          <div class="usage-toolbar-actions"><button class="usage-button" id="usage-export" disabled>导出</button>
+            <button class="usage-button usage-button--subtle" id="usage-refresh">刷新</button>
+            <label class="usage-filter usage-zone"><select id="usage-zone" aria-label="选择时区"><option value="Asia/Shanghai">GMT+8</option><option value="UTC">UTC+0</option></select></label></div>
+          <div class="usage-dates" id="usage-dates" hidden><label>开始日期 <input type="date" id="usage-from" required></label>
+            <span>至</span><label>结束日期 <input type="date" id="usage-to" required></label><button class="usage-button" id="usage-apply">应用</button></div>
+        </div>
+        <div class="usage-summary">
+          <div class="usage-card"><span>输入 Tokens</span><strong id="usage-input">–</strong><small id="usage-cached">缓存命中 –</small></div>
+          <div class="usage-card"><span>API 请求次数</span><strong id="usage-requests">–</strong><small id="usage-outcomes">–</small></div>
+          <div class="usage-card"><span>Tokens</span><strong id="usage-total">–</strong><small id="usage-output">输出 –</small></div>
+        </div>
+        <div class="usage-card usage-trend">
+          <div class="usage-chart-heading"><h2>Tokens <span id="usage-trend-total"></span></h2>
+            <div class="usage-segments" role="group" aria-label="用量分组"><button id="usage-group-path" aria-pressed="false">调用类型</button><button id="usage-group-key" aria-pressed="true">API Key</button></div></div>
+          <div id="usage-trend-chart"></div><div class="usage-legend" id="usage-legend"></div>
+        </div>
+        <p id="usage-empty" class="usage-empty" hidden>此日期范围内没有调用记录。可调整日期或选择其他 API Key。</p>
+        <h2>模型用量</h2><p class="usage-note">下方图表按模型显示，仍受上方日期和 API Key 筛选影响。</p>
+        <div id="usage-groups"></div>
+        <div class="usage-details"><h2>API Key 用量明细</h2><p class="usage-note">输入包含缓存部分；请求数包含成功、失败、中断和进行中。仅显示当前存在的 Key，包含已停用的 Key。</p>
+          <div class="table-wrap"><table class="st-table usage-table"><thead><tr><th>API Key</th><th>状态</th><th>请求</th><th>成功</th><th>失败</th><th>中断</th><th>进行中</th><th>输入 Tokens</th><th>缓存输入</th><th>输出 Tokens</th><th>总 Tokens</th><th>未完整结算</th></tr></thead><tbody id="usage-rows"></tbody></table></div>
+        </div>
+        <p class="usage-note" id="usage-updated"></p>
+      </div>
+    </div>
+  </section>
+
+  <div id="usage-tooltip" class="usage-tooltip" role="tooltip" hidden></div>
+
+  <section class="view view--api" id="view-api" role="tabpanel" aria-labelledby="tab-btn-api" lang="zh-CN" hidden>
+    <div class="api-page">
+      <header class="api-intro">
+        <h1>连接 Strata API</h1>
+        <p class="muted">从自己的程序或其他应用调用模型。复制下面的地址和示例，即可开始。</p>
+      </header>
+
+      <section class="st-card api-card">
+        <h2>连接信息</h2>
+        <dl class="facts" id="api-addresses"></dl>
+        <p class="muted small">地址取自当前页面。其他设备连接时，请使用运行 Strata 的局域网地址，确保服务监听该地址并设置调用 Key。</p>
+      </section>
+
+      <section class="st-card api-card">
+        <div><h2>可用模型名称</h2>
+          <p class="muted small">来自 <code>GET /v1/models</code>，结果与当前调用 Key 对应。</p></div>
+        <form id="api-key-form">
+          <label class="st-label" for="api-call-key">调用 Key <output>未启用认证时留空</output></label>
+          <div class="api-key-row"><input class="st-input" id="api-call-key" type="password" autocomplete="off" placeholder="输入调用 Key">
+            <button class="st-btn st-btn--secondary" type="submit">保存并刷新</button></div>
+        </form>
+        <p class="muted small">Key 保存在此浏览器中，与 About 中的设置共用。</p>
+        <p class="muted small" id="api-managed-note" hidden>每个 Key 使用分配给它的模型，可在 <a href="#keys">API Keys</a> 中管理。管理员密钥不能用于模型调用。</p>
+        <p id="api-model-status" class="small" role="status" aria-live="polite"></p>
+        <ul id="api-models" class="api-models"></ul>
+      </section>
+
+      <section class="st-card api-card">
+        <h2>调用示例</h2>
+        <p class="muted small">示例使用列表中的首个对话模型，获取失败时请替换 <code>YOUR_MODEL_NAME</code>。将 <code>YOUR_API_KEY</code> 替换为调用 Key；未启用认证时可保留占位值。其他设备请替换地址。</p>
+        <div class="st-code"><div class="st-code__head"><span>Python · OpenAI SDK</span>
+          <button class="st-btn st-btn--icon" type="button" data-api-copy="api-example-python" aria-label="复制 Python 示例"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></div>
+          <pre id="api-example-python"></pre></div>
+        <div class="st-code"><div class="st-code__head"><span>PowerShell · OpenAI Chat Completions</span>
+          <button class="st-btn st-btn--icon" type="button" data-api-copy="api-example-openai" aria-label="复制 OpenAI 示例"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></div>
+          <pre id="api-example-openai"></pre></div>
+        <div class="st-code"><div class="st-code__head"><span>PowerShell · Anthropic Messages</span>
+          <button class="st-btn st-btn--icon" type="button" data-api-copy="api-example-anthropic" aria-label="复制 Anthropic 示例"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></div>
+          <pre id="api-example-anthropic"></pre></div>
+      </section>
     </div>
   </section>
 
@@ -317,5 +479,7 @@
 <script src="web/chatstore.js"></script>
 <script src="web/chats-ui.js"></script>
 <script src="web/app.js"></script>
+<script src="web/keys.js"></script>
+<script src="web/usage.js"></script>
 </body>
 </html>
