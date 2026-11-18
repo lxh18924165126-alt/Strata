@@ -86,7 +86,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
-from serve.key_store import KeyStore, StoreUnavailable  # noqa: E402
+from serve.key_store import KeyExpired, KeyStore, QuotaExceeded, StoreUnavailable  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -5299,10 +5299,15 @@ class Service:
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
+            now = time.time()
             s["generated"] = n
             if s.get("first_token") is None:
-                s["first_token"] = time.time()
-            (self.rate if rate is None else rate).append((time.time(), n))   # the live rate's window (RATE_WINDOW_S)
+                s["first_token"] = now
+            samples = self.rate if rate is None else rate
+            samples.append((now, n))   # the live rate's window (RATE_WINDOW_S)
+            if n >= 2 and now - s["first_token"] >= RATE_MIN_SPAN_S:
+                current = self._rate_of(s, samples)
+                s["decode_peak_tok_s"] = max(s.get("decode_peak_tok_s") or 0.0, current)
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -5516,7 +5521,7 @@ class Service:
                             self.terminal_requests[request_id].update(state="waiting", admitted_at=time.time())
                             self._terminal_event_locked(request_id, "admitted")
                         st.update(busy=True, request_id=request_id, phase="reading the prompt", prompt_tokens=len(ids),
-                                  generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                  generated=0, started=time.time(), first_token=None, decode_peak_tok_s=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
@@ -5791,6 +5796,8 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
+                                "decode_peak_tok_s": round(st["decode_peak_tok_s"], 1)
+                                if st.get("decode_peak_tok_s") is not None else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
@@ -7016,6 +7023,10 @@ def make_handler(svc: Service):
             if svc.key_store is not None:
                 try:
                     self.key_id = svc.key_store.authenticate(self._given_key())
+                except KeyExpired as e:
+                    self._json(401, {"error": {"type": "authentication_error", "code": "api_key_expired",
+                                               "message": str(e)}})
+                    return False
                 except StoreUnavailable as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return False
@@ -7090,6 +7101,12 @@ def make_handler(svc: Service):
                             raise ValueError("所选模型未安装或不可用")
                         svc.key_store.set_model(parts[2], model)
                         self._json(200, {"id": parts[2], "model": model})
+                    elif len(parts) == 4 and parts[3] == "quota":
+                        fields = ("expires_at", "daily_token_limit", "weekly_token_limit")
+                        if any(field not in req for field in fields):
+                            raise ValueError("请提供 expires_at、daily_token_limit 和 weekly_token_limit")
+                        svc.key_store.set_quota(parts[2], *(req[field] for field in fields))
+                        self._json(200, {"id": parts[2], **{field: req[field] for field in fields}})
                     elif len(parts) == 4 and parts[3] in ("state", "delete"):
                         state = "deleted" if parts[3] == "delete" else req.get("state")
                         if parts[3] == "state" and state not in ("active", "disabled"):
@@ -7586,6 +7603,12 @@ def make_handler(svc: Service):
                     self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except QuotaExceeded as e:
+                self._json(429, {"error": {"type": "insufficient_quota", "code": "insufficient_quota",
+                                           "message": str(e)}})
+            except KeyExpired as e:
+                self._json(401, {"error": {"type": "authentication_error", "code": "api_key_expired",
+                                           "message": str(e)}})
             except StoreUnavailable as e:
                 self._usage_failure(e)
             except Exception:
@@ -7633,7 +7656,7 @@ def make_handler(svc: Service):
             if path == "/api/keys" or path.startswith("/api/keys/"):
                 self._keys_api(path, post=True)
                 return
-            if not self._authorized():
+            if self.usage is None and not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages

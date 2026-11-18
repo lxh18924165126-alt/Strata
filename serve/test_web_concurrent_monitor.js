@@ -76,4 +76,13 @@ assert.equal($("state-request").textContent, "Last completed request");
 assert.equal($("ctx-sub").textContent, "420 / 4000");
 assert.equal(metrics.prefill.value, "400");
 assert.equal(metrics.speed.value, "0.0");
+// Completed rows preserve the sampled peak separately from the average.
+context.renderMonitor({state: "idle", requests: []}, {}, {}, {}, {}, null,
+  [{time: 1, finish: "stop", decode_tok_s: 12.3, decode_peak_tok_s: 45.6}], null, 1);
+assert.match($("req-body").innerHTML, /12\.3<\/td><td class="num">45\.6<\/td>/);
+context.renderMonitor({state: "idle", requests: []}, {}, {}, {}, {}, null,
+  [{time: 1, finish: "stop", decode_tok_s: 12.3}], null, 1);
+assert.match($("req-body").innerHTML, /12\.3<\/td><td class="num">–<\/td>/);
+context.renderMonitor({state: "idle", requests: []}, {}, {}, {}, {}, null, [], null, 0);
+assert.match($("req-body").innerHTML, /colspan="10"/);
 console.log("ok concurrent Monitor");

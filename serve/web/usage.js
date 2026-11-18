@@ -63,7 +63,10 @@
     return times;
   }
   function compact(n) {
-    return n >= 1e9 ? `${Number((n / 1e9).toFixed(1))}B` : n >= 1e6 ? `${Number((n / 1e6).toFixed(1))}M` : n >= 1e3 ? `${Number((n / 1e3).toFixed(1))}k` : number(n);
+    for (const [scale, unit] of [[1e18, "E"], [1e15, "P"], [1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
+      if (n >= scale) return `${Number((n / scale).toFixed(1))}${unit}`;
+    }
+    return number(n);
   }
   function chart(times, series, metric, area = false, label = metric, width = 900, includeZero = true) {
     const height = 280, left = 55, top = 20, bottom = 245, plot = width - left - 14;
@@ -240,7 +243,10 @@
   document.addEventListener("strata-usage-view", enter); document.addEventListener("strata-health", enter);
   document.addEventListener("strata-admin-session", () => { if (!admin.hasCredential()) { clear(); message(); } });
   el("workspace").addEventListener("pointermove", showTooltip);
-  el("workspace").addEventListener("pointerleave", hideTooltip);
+  el("workspace").addEventListener("pointerleave", event => {
+    if (!el("tooltip").contains(event.relatedTarget)) hideTooltip();
+  });
+  el("tooltip").addEventListener("pointerleave", hideTooltip);
   el("workspace").addEventListener("pointercancel", hideTooltip);
   el("workspace").addEventListener("click", showTooltip);
   document.getElementById("view-usage").addEventListener("scroll", hideTooltip, true);

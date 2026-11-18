@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import math
 import secrets
 import sqlite3
 import threading
@@ -16,6 +17,14 @@ class StoreUnavailable(RuntimeError):
     pass
 
 
+class QuotaExceeded(RuntimeError):
+    pass
+
+
+class KeyExpired(RuntimeError):
+    pass
+
+
 FIELDS = ("requests", "successful", "failed", "interrupted", "running", "input_tokens",
           "cached_tokens", "output_tokens", "total_tokens", "incomplete")
 SUMS = """COUNT(*) AS requests,
@@ -25,6 +34,13 @@ SUMS = """COUNT(*) AS requests,
  SUM(output_tokens) AS output_tokens, SUM(input_tokens+output_tokens) AS total_tokens,
  SUM(incomplete) AS incomplete"""
 BEIJING = dt.timezone(dt.timedelta(hours=8))
+
+
+def quota_bounds(now):
+    day = dt.datetime.fromtimestamp(now, BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+    week = day - dt.timedelta(days=day.weekday())
+    return day.timestamp(), (day + dt.timedelta(days=1)).timestamp(), week.timestamp(), \
+        (week + dt.timedelta(days=7)).timestamp()
 
 
 def date_bounds(start=None, end=None, timezone=BEIJING):
@@ -83,6 +99,13 @@ class KeyStore:
             with self.db:
                 if "model" not in {row[1] for row in self.db.execute("PRAGMA table_info(api_keys)")}:
                     self.db.execute("ALTER TABLE api_keys ADD COLUMN model TEXT")
+                if "token_limit" not in {row[1] for row in self.db.execute("PRAGMA table_info(api_keys)")}:
+                    self.db.execute("ALTER TABLE api_keys ADD COLUMN token_limit INTEGER CHECK(token_limit >= 0)")
+                columns = {row[1] for row in self.db.execute("PRAGMA table_info(api_keys)")}
+                for name, kind in (("expires_at", "REAL"), ("daily_token_limit", "INTEGER"),
+                                   ("weekly_token_limit", "INTEGER")):
+                    if name not in columns:
+                        self.db.execute(f"ALTER TABLE api_keys ADD COLUMN {name} {kind}")
                 if "model" not in {row[1] for row in self.db.execute("PRAGMA table_info(key_usage)")}:
                     self.db.execute("ALTER TABLE key_usage ADD COLUMN model TEXT")
                 self.db.execute("UPDATE key_usage SET state='interrupted', incomplete=1, finished_at=? "
@@ -125,7 +148,9 @@ class KeyStore:
         except (UnicodeError, ValueError):
             candidates.append(candidates[0])
         with self.transaction() as db:
-            row = db.execute("SELECT id FROM api_keys WHERE digest IN (?,?) AND state='active'", candidates).fetchone()
+            row = db.execute("SELECT id,expires_at FROM api_keys WHERE digest IN (?,?) AND state='active'", candidates).fetchone()
+            if row and row["expires_at"] is not None and time.time() >= row["expires_at"]:
+                raise KeyExpired("API Key 已过期")
             return row["id"] if row else None
 
     def create(self, name):
@@ -151,6 +176,26 @@ class KeyStore:
             if row["state"] == "deleted":
                 raise ValueError("已删除的 Key 不能修改模型")
             db.execute("UPDATE api_keys SET model=? WHERE id=?", (model, ident))
+
+    def set_quota(self, ident, expires_at, daily_token_limit, weekly_token_limit):
+        if expires_at is not None:
+            try:
+                if type(expires_at) not in (int, float) or not math.isfinite(expires_at) or expires_at < 0:
+                    raise ValueError
+                dt.datetime.fromtimestamp(expires_at, dt.timezone.utc)
+            except (ValueError, OverflowError, OSError):
+                raise ValueError("expires_at 应为有效的非负 Unix 时间戳或 null") from None
+        for name, limit in (("daily_token_limit", daily_token_limit), ("weekly_token_limit", weekly_token_limit)):
+            if limit is not None and (type(limit) is not int or not 0 <= limit <= 2**63 - 1):
+                raise ValueError(f"{name} 应为非负整数或 null")
+        with self.transaction() as db:
+            row = db.execute("SELECT state FROM api_keys WHERE id=?", (ident,)).fetchone()
+            if not row:
+                raise KeyError(ident)
+            if row["state"] == "deleted":
+                raise ValueError("已删除的 Key 不能修改限额")
+            db.execute("UPDATE api_keys SET expires_at=?,daily_token_limit=?,weekly_token_limit=? WHERE id=?",
+                       (expires_at, daily_token_limit, weekly_token_limit, ident))
 
     def change(self, ident, state):
         if state not in ("active", "disabled", "deleted"):
@@ -179,12 +224,22 @@ class KeyStore:
     def list(self, include_deleted=False, start=None, end=None):
         where, params = self._filter(start, end)
         with self.transaction() as db:
-            rows = db.execute("SELECT id,name,preview,state,created_at,last_used_at,deleted_at,model FROM api_keys "
+            rows = db.execute("SELECT id,name,preview,state,created_at,last_used_at,deleted_at,model,"
+                              "expires_at,daily_token_limit,weekly_token_limit FROM api_keys "
                               + ("" if include_deleted else "WHERE state!='deleted' ")
                               + "ORDER BY created_at DESC").fetchall()
             stats = {r["key_id"]: totals(r) for r in db.execute(
                 f"SELECT key_id,{SUMS} FROM key_usage WHERE 1=1 {where} GROUP BY key_id", params)}
-            return [{**dict(row), "usage": stats.get(row["id"], totals(None))} for row in rows]
+            now = time.time()
+            day_start, day_end, week_start, week_end = quota_bounds(now)
+            period = {r["key_id"]: r for r in db.execute(
+                "SELECT key_id, SUM(CASE WHEN started_at>=? AND started_at<? THEN input_tokens+output_tokens ELSE 0 END) AS daily, "
+                "SUM(input_tokens+output_tokens) AS weekly FROM key_usage WHERE started_at>=? AND started_at<? GROUP BY key_id",
+                (day_start, day_end, week_start, week_end))}
+            return [{**dict(row), "usage": stats.get(row["id"], totals(None)),
+                     "daily_used_tokens": period[row["id"]]["daily"] if row["id"] in period else 0,
+                     "weekly_used_tokens": period[row["id"]]["weekly"] if row["id"] in period else 0,
+                     "is_expired": row["expires_at"] is not None and now >= row["expires_at"]} for row in rows]
 
     def usage(self, ident, start=None, end=None):
         where, params = self._filter(start, end)
@@ -260,8 +315,23 @@ class KeyStore:
                 "keys": keys, "groups": list(groups.values()), "model_groups": list(model_groups.values())}
 
     def begin(self, key_id, path, model=None):
-        ident, now = uuid.uuid4().hex, time.time()
+        ident = uuid.uuid4().hex
         with self.transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            day_start, day_end, week_start, week_end = quota_bounds(now)
+            row = db.execute("SELECT expires_at,daily_token_limit,weekly_token_limit FROM api_keys WHERE id=?",
+                             (key_id,)).fetchone()
+            if row["expires_at"] is not None and now >= row["expires_at"]:
+                raise KeyExpired("API Key 已过期")
+            usage = db.execute("SELECT COALESCE(SUM(CASE WHEN started_at>=? AND started_at<? "
+                               "THEN input_tokens+output_tokens ELSE 0 END),0) AS daily, "
+                               "COALESCE(SUM(input_tokens+output_tokens),0) AS weekly FROM key_usage "
+                               "WHERE key_id=? AND started_at>=? AND started_at<?",
+                               (day_start, day_end, key_id, week_start, week_end)).fetchone()
+            if ((row["daily_token_limit"] is not None and usage["daily"] >= row["daily_token_limit"]) or
+                    (row["weekly_token_limit"] is not None and usage["weekly"] >= row["weekly_token_limit"])):
+                raise QuotaExceeded("API Key token 限额已用完")
             db.execute("INSERT INTO key_usage(id,key_id,path,started_at,state,incomplete,model) "
                        "VALUES (?,?,?,?,'running',1,?)", (ident, key_id, path, now, model))
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now, key_id))

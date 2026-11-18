@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.key_store import KeyStore
+from serve.key_store import KeyStore, KeyExpired, QuotaExceeded
 from serve.server import ByteTokenizer, MockEngine, Service, KeyModelRouter, configure_key_management, serve
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +87,200 @@ class KeyHttpCase(unittest.TestCase):
 
 
 class ManagedKeys(KeyHttpCase):
+    def test_token_quota_defaults_validation_and_persistence(self):
+        created = self.create()
+        rows = self.call("/api/keys", key=ADMIN)[1]["keys"]
+        self.assertTrue(all(row["daily_token_limit"] is None and row["weekly_token_limit"] is None and row["expires_at"] is None for row in rows))
+        endpoint = f"/api/keys/{self.legacy_id}/quota"
+        for key, expected in ((None, 401), (LEGACY, 403)):
+            self.assertEqual(self.call(endpoint, {"daily_token_limit": 0, "weekly_token_limit": None, "expires_at": None}, key)[0], expected)
+        self.assertEqual(self.call(endpoint, {"daily_token_limit": 0, "weekly_token_limit": None, "expires_at": None}, ADMIN,
+                                   {"Origin": "https://evil.example"})[0], 403)
+        for value in (-1, True, 1.5, "100", 2**63):
+            self.assertEqual(self.call(endpoint, {"daily_token_limit": value, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 400)
+        self.assertEqual(self.call(endpoint, {}, ADMIN)[0], 400)
+        self.assertEqual(self.call("/api/keys/missing/quota", {"daily_token_limit": 1, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 404)
+        self.assertEqual(self.call(endpoint, {"daily_token_limit": 0, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 200)
+        self.assertEqual(self.chat(key=created["key"])[0], 200)
+        expires = time.time() + 3600
+        self.assertEqual(self.call(endpoint, {"daily_token_limit": 0, "weekly_token_limit": 100, "expires_at": expires}, ADMIN)[0], 200)
+        self.stop()
+        self.start()
+        self.assertEqual(self.chat()[0], 429)
+        row = next(r for r in self.call("/api/keys", key=ADMIN)[1]["keys"] if r["id"] == self.legacy_id)
+        self.assertEqual((row["expires_at"], row["weekly_token_limit"]), (expires, 100))
+        self.assertEqual(self.call(endpoint, {"daily_token_limit": None, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 200)
+        self.assertEqual(self.chat()[0], 200)
+        self.call(f"/api/keys/{created['id']}/delete", {}, ADMIN)
+        self.assertEqual(self.call(f"/api/keys/{created['id']}/quota", {"daily_token_limit": 1, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 400)
+
+    def test_daily_quota_boundary_protocols_and_date_filters(self):
+        self.assertEqual(self.chat()[0], 200)
+        used = self.usage()["total_tokens"]
+        endpoint = f"/api/keys/{self.legacy_id}/quota"
+        self.assertEqual(self.call(endpoint, {"daily_token_limit": used, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 200)
+        before = self.usage()
+        for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/v1/messages"):
+            for stream in (False, True):
+                code, result = self.chat(path, stream)
+                self.assertEqual(code, 429, result)
+                self.assertEqual(result["error"]["code"], "insufficient_quota")
+        self.assertEqual(self.usage(), before)
+        self.assertEqual(self.call("/v1/models")[0], 200)
+        self.assertEqual(self.call("/v1/messages/count_tokens", {"messages": [{"role": "user", "content": "Hi"}]})[0], 200)
+        rows = self.call("/api/keys?from=2000-01-01&to=2000-01-01", key=ADMIN)[1]["keys"]
+        row = next(r for r in rows if r["id"] == self.legacy_id)
+        self.assertEqual(row["usage"]["total_tokens"], 0)
+        self.assertEqual(row["daily_used_tokens"], used)
+        self.call(endpoint, {"daily_token_limit": used + 1, "weekly_token_limit": None, "expires_at": None}, ADMIN)
+        self.assertEqual(self.chat()[0], 200)
+        self.assertEqual(self.chat()[0], 429)
+
+    def test_token_quota_allows_accepted_request_to_finish(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.svc.engine.generate
+        def held(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release the engine")
+            yield from original(*args, **kwargs)
+        self.svc.engine.generate = held
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.chat)
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.call(f"/api/keys/{self.legacy_id}/quota", {"daily_token_limit": 0, "weekly_token_limit": None, "expires_at": None}, ADMIN)[0], 200)
+                self.assertEqual(self.chat()[0], 429)
+            finally:
+                release.set()
+            self.assertEqual(future.result()[0], 200)
+        self.assertEqual(self.usage()["successful"], 1)
+        self.assertGreater(self.usage()["total_tokens"], 0)
+
+    def test_token_quota_concurrent_admissions_and_cached_input(self):
+        store = self.svc.key_store
+        store.set_quota(self.legacy_id, None, 10, None)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            accepted = list(pool.map(lambda _: store.begin(self.legacy_id, "/v1/messages"), range(2)))
+        accepted[0].add(8, 8, 2, "stop")
+        accepted[0].finish()
+        with self.assertRaises(QuotaExceeded):
+            store.begin(self.legacy_id, "/v1/messages")
+        accepted[1].add(8, 8, 2, "stop")
+        accepted[1].finish()
+        self.assertEqual(self.usage()["total_tokens"], 20)
+        self.assertEqual(self.usage()["successful"], 2)
+
+    def test_token_quota_with_model_router(self):
+        path = Path(self.tmp.name) / "coder.json"
+        path.write_text("{}")
+        self.svc.model_router = KeyModelRouter(self.svc, {"coder": str(path)})
+        self.call(f"/api/keys/{self.legacy_id}/quota", {"daily_token_limit": 0, "weekly_token_limit": None, "expires_at": None}, ADMIN)
+        self.assertEqual(self.chat()[0], 429)
+        self.assertEqual(self.usage()["requests"], 0)
+
+    def test_previous_lifetime_limit_is_no_longer_enforced(self):
+        with self.svc.key_store.transaction() as db:
+            db.execute("UPDATE api_keys SET token_limit=0 WHERE id=?", (self.legacy_id,))
+        self.assertEqual(self.chat()[0], 200)
+        row = self.call("/api/keys", key=ADMIN)[1]["keys"][0]
+        self.assertIsNone(row["expires_at"])
+        self.assertIsNone(row["daily_token_limit"])
+        self.assertIsNone(row["weekly_token_limit"])
+
+    def test_key_expiry_and_renewal(self):
+        endpoint = f"/api/keys/{self.legacy_id}/quota"
+        policy = {"expires_at": time.time() - 1, "daily_token_limit": None, "weekly_token_limit": None}
+        self.assertEqual(self.call(endpoint, policy, ADMIN)[0], 200)
+        for path in ("/v1/models", "/props"):
+            code, result = self.call(path)
+            self.assertEqual(code, 401)
+            self.assertEqual(result["error"]["code"], "api_key_expired")
+        for path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+            self.assertEqual(self.chat(path)[0], 401)
+        self.assertEqual(self.usage()["requests"], 0)
+        self.assertTrue(self.call("/api/keys", key=ADMIN)[1]["keys"][0]["is_expired"])
+        policy["expires_at"] = time.time() + 3600
+        self.assertEqual(self.call(endpoint, policy, ADMIN)[0], 200)
+        self.assertEqual(self.chat()[0], 200)
+        for value in (True, "tomorrow", -1, float("inf"), float("nan"), 10**30):
+            policy["expires_at"] = value
+            self.assertEqual(self.call(endpoint, policy, ADMIN)[0], 400)
+        policy["expires_at"] = None
+        for value in (-1, True, 1.5, "100", 2**63):
+            policy["weekly_token_limit"] = value
+            self.assertEqual(self.call(endpoint, policy, ADMIN)[0], 400)
+
+    def test_period_limits_reset_at_beijing_midnight_and_monday(self):
+        store = self.svc.key_store
+        stamp = lambda date: dt.datetime.fromisoformat(date + "+08:00").timestamp()
+        sunday = stamp("2026-11-08T23:59:59")
+        monday = stamp("2026-11-09T00:00:00")
+        with mock.patch("serve.key_store.time.time", return_value=sunday):
+            store.set_quota(self.legacy_id, None, 10, 15)
+            work = store.begin(self.legacy_id, "/v1/messages")
+            work.add(8, 8, 2, "stop")
+            work.finish()
+            with self.assertRaises(QuotaExceeded):
+                store.begin(self.legacy_id, "/v1/messages")
+        with mock.patch("serve.key_store.time.time", return_value=monday):
+            row = store.list()[0]
+            self.assertEqual((row["daily_used_tokens"], row["weekly_used_tokens"]), (0, 0))
+            work = store.begin(self.legacy_id, "/v1/messages")
+            work.add(8, 8, 2, "stop")
+            work.finish()
+        with mock.patch("serve.key_store.time.time", return_value=stamp("2026-11-10T00:00:00")):
+            row = store.list()[0]
+            self.assertEqual((row["daily_used_tokens"], row["weekly_used_tokens"]), (0, 10))
+            work = store.begin(self.legacy_id, "/v1/messages")
+            work.add(3, 0, 2, "stop")
+            work.finish()
+            with self.assertRaises(QuotaExceeded):
+                store.begin(self.legacy_id, "/v1/messages")
+        with mock.patch("serve.key_store.time.time", return_value=stamp("2026-11-16T00:00:00")):
+            work = store.begin(self.legacy_id, "/v1/messages")
+            work.finish()
+
+    def test_midnight_completion_counts_toward_start_period(self):
+        store = self.svc.key_store
+        midnight = dt.datetime.fromisoformat("2026-11-09T00:00:00+08:00").timestamp()
+        with mock.patch("serve.key_store.time.time", return_value=midnight - 1):
+            work = store.begin(self.legacy_id, "/v1/messages")
+        with mock.patch("serve.key_store.time.time", return_value=midnight):
+            work.add(100, 0, 10, "stop")
+            work.finish()
+            row = store.list()[0]
+            self.assertEqual((row["daily_used_tokens"], row["weekly_used_tokens"]), (0, 0))
+        self.assertEqual(self.usage()["total_tokens"], 110)
+
+    def test_routed_request_can_expire_after_admission(self):
+        path = Path(self.tmp.name) / "coder.json"
+        path.write_text("{}")
+        self.svc.model_router = KeyModelRouter(self.svc, {"coder": str(path)})
+        store = self.svc.key_store
+        begin = store.begin
+        def expire_after_begin(*args, **kwargs):
+            work = begin(*args, **kwargs)
+            store.set_quota(self.legacy_id, time.time() - 1, None, None)
+            return work
+        with mock.patch.object(store, "begin", side_effect=expire_after_begin):
+            self.assertEqual(self.chat()[0], 200)
+        self.assertEqual(self.chat()[0], 401)
+        self.assertEqual(self.usage()["successful"], 1)
+
+    def test_expiry_does_not_abort_accepted_work(self):
+        store = self.svc.key_store
+        expires = time.time() + 100
+        store.set_quota(self.legacy_id, expires, None, None)
+        work = store.begin(self.legacy_id, "/v1/messages")
+        with mock.patch("serve.key_store.time.time", return_value=expires):
+            work.add(3, 0, 2, "stop")
+            work.finish()
+            self.assertTrue(store.list()[0]["is_expired"])
+            with self.assertRaises(KeyExpired):
+                store.begin(self.legacy_id, "/v1/messages")
+        self.assertEqual(self.usage()["successful"], 1)
+
     def test_model_usage_tracks_routing_and_filters(self):
         coder_path = Path(self.tmp.name) / 'coder.json'
         spare_path = Path(self.tmp.name) / 'spare.json'
@@ -144,6 +338,9 @@ class ManagedKeys(KeyHttpCase):
         db.close()
         store = KeyStore(path)
         try:
+            self.assertIsNone(store.list()[0]['daily_token_limit'])
+            self.assertIsNone(store.list()[0]['weekly_token_limit'])
+            self.assertIsNone(store.list()[0]['expires_at'])
             store.set_model('old', 'new-assignment')
             report = store.usage_report(models=['new-assignment'])
             groups = {g['id']: g for g in report['model_groups']}

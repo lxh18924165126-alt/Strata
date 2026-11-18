@@ -844,7 +844,28 @@ its SHA-256 digest and a masked preview are stored. Deletion is permanent revoca
 hidden from the default list. Disabling or deleting affects new requests; accepted requests continue and settle.
 Existing keys from `api_key`, `--api-key` or `STRATA_API_KEY` are imported on startup. The database decides whether
 they are active: an old config entry cannot bypass revocation or reactivate a disabled/deleted key after restart.
-Other API permissions remain as before; this is not a quota or rate-limiting feature.
+Other API permissions remain as before. In API Keys, set an expiration time and daily or weekly token
+limits for each key. Existing keys and newly created keys default to permanent validity and unlimited usage.
+Leave an expiration or limit blank to remove that restriction. Setting a token limit to 0 blocks new inference
+requests. The former lifetime token limit is no longer enforced; its old database column may remain unused.
+
+Expiration is entered and displayed in Beijing time (UTC+8). At the expiration instant, new authenticated calls
+return HTTP 401 with error code `api_key_expired`. Extending or clearing expiration makes an active key usable
+again. It does not reactivate a disabled or deleted key.
+
+Daily usage resets at 00:00 Beijing time. Weekly usage resets on Monday at 00:00 Beijing time, not every day.
+Both limits apply when set: reaching either one refuses new Chat Completions, Messages and Responses requests
+with HTTP 429 and error code `insufficient_quota`. Usage is input plus output, including cached input, thinking
+and tool-call tokens. A request's start time determines its day and week, including calls that finish after midnight.
+Existing usage in the current period counts toward the limit, across all models assigned to that key. Date filters
+only change the report; they do not change quota usage. Period boundaries are calculated on each request, so no
+scheduled reset job or server restart is needed. Limits and usage survive restarts.
+
+Rejected calls do not add usage records. Already accepted requests finish normally, including their MCP rounds,
+even if their key expires or a limit changes. Concurrent accepted calls may exceed a limit. These limits control
+admission, not strict spending caps or request rates. Metadata, token-count-only calls and image generation are
+outside token limits, but still require an unexpired key where authentication is required. Crash-lost work cannot
+be reconstructed and does not count toward usage.
 
 To assign installed models to keys, add `"key_model_configs": {"model-id": "strata-other.json"}` to the
 primary run config. Paths are relative to that config. The model ID must match the other config's `model_name`.
@@ -907,10 +928,15 @@ Admin endpoints (Bearer or `x-api-key` with the separate administrator secret):
 | --- | --- |
 | `GET /api/keys` | List keys and usage; `include_deleted=true` includes deleted keys |
 | `POST /api/keys` | Create with `{"name":"Laptop"}`; the response contains the new key once |
+| `POST /api/keys/<id>/quota` | Set all three fields: `{"expires_at":null,"daily_token_limit":100000,"weekly_token_limit":500000}`; `null` removes a restriction |
 | `POST /api/keys/<id>/state` | Set `{"state":"active"}` or `{"state":"disabled"}` |
 | `POST /api/keys/<id>/delete` | Send `{}` to revoke permanently, retaining history |
 | `GET /api/keys/<id>/usage` | Selected-range summary, lifetime summary, and daily rows |
 | `GET /api/keys/usage` | Dashboard totals, time series and groups; includes deleted keys |
+
+`expires_at` is a UTC Unix timestamp in seconds, or `null` for permanent validity. Token limits are nonnegative integers.
+`GET /api/keys` returns `expires_at`, `is_expired`, `daily_token_limit`, `weekly_token_limit`,
+`daily_used_tokens` and `weekly_used_tokens`; current-period usage is independent of date filters.
 
 All GET endpoints accept `from=YYYY-MM-DD&to=YYYY-MM-DD`. The dashboard endpoint also accepts `key_id`,
 `interval=day|hour`, `group=key|path` and `timezone=Asia/Shanghai|UTC`; defaults are day, key and Asia/Shanghai.

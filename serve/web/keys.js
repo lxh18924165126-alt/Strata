@@ -2,11 +2,11 @@
 "use strict";
 (() => {
   const el = id => document.getElementById(`keys-${id}`);
-  let admin = "", selected = null, pendingDelete = null, revision = 0, refreshTimer = null, rows = [], models = [], defaultModel = "";
+  let admin = "", selected = null, pendingDelete = null, pendingQuota = null, revision = 0, refreshTimer = null, rows = [], models = [], defaultModel = "";
   try { admin = sessionStorage.getItem("strata.keys.admin") || ""; } catch (_) {}
   const states = {active: "启用", disabled: "已停用", deleted: "已删除"};
   const number = n => Number(n || 0).toLocaleString("zh-CN");
-  const stamp = t => t ? new Date(t * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false}) : "尚无调用";
+  const stamp = t => t != null ? new Date(t * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false}) : "尚无调用";
   function message(text = "", error = false) { el("message").textContent = text; el("message").dataset.error = String(error); }
   function credential(value) {
     admin = value;
@@ -15,11 +15,11 @@
   function clearSecret() { el("secret-value").value = ""; el("copy-status").textContent = ""; }
   function logout() {
     ++revision; credential(""); clearTimeout(refreshTimer);
-    selected = pendingDelete = null; rows = [];
+    selected = pendingDelete = pendingQuota = null; rows = [];
     el("rows").replaceChildren(); el("daily").replaceChildren(); el("summary").replaceChildren();
     el("detail").hidden = true; el("workspace").hidden = true; el("logout").hidden = true;
     el("login").hidden = false; el("admin").value = "";
-    for (const name of ["secret", "confirm"]) if (el(name).open) el(name).close();
+    for (const name of ["secret", "confirm", "quota"]) if (el(name).open) el(name).close();
     clearSecret(); message("已退出管理，当前标签页的管理凭证已清除。");
     document.dispatchEvent(new Event("strata-admin-session"));
   }
@@ -94,9 +94,23 @@
       const time = cell(tr, ""); const created = document.createElement("span"); created.textContent = stamp(row.created_at);
       const used = document.createElement("small"); used.textContent = stamp(row.last_used_at); time.append(created, used);
       for (const k of ["requests", "input_tokens", "output_tokens", "total_tokens"]) cell(tr, number(row.usage[k]), "num");
+      const quota = cell(tr, row.expires_at === null ? "永久有效" :
+        `到期：${stamp(row.expires_at)}（北京时间）${row.is_expired ? " · 已到期" : ""}`);
+      for (const [label, limit, used] of [["每日", row.daily_token_limit, row.daily_used_tokens], ["每周", row.weekly_token_limit, row.weekly_used_tokens]]) {
+        const line = document.createElement("small");
+        line.textContent = `${label}已用 ${number(used)} Token · ` + (limit === null ? "不限额" :
+          `上限 ${number(limit)} · 剩余 ${number(Math.max(0, limit - used))}${used >= limit ? " · 已耗尽" : ""}`);
+        quota.append(line);
+      }
       const actions = cell(tr, "", "keys-actions");
       actions.append(button("用量", async () => { selected = row.id; await detail(); }, `查看 ${row.name} 的用量`));
       if (row.state !== "deleted") {
+        actions.append(button("限额", () => {
+          pendingQuota = row.id; el("quota-title").textContent = `设置「${row.name}」的有效期和限额`; el("quota-message").textContent = "";
+          el("quota-expires").value = row.expires_at === null ? "" : new Date((row.expires_at + 8 * 3600) * 1000).toISOString().slice(0, 19);
+          el("quota-daily").value = row.daily_token_limit === null ? "" : row.daily_token_limit;
+          el("quota-weekly").value = row.weekly_token_limit === null ? "" : row.weekly_token_limit; el("quota").showModal();
+        }, `设置 ${row.name} 的有效期和限额`));
         actions.append(button(row.state === "active" ? "停用" : "启用", async () => {
           await api(`api/keys/${row.id}/state`, {state: row.state === "active" ? "disabled" : "active"});
           message(row.state === "active" ? "Key 已停用，新的调用将被拒绝。" : "Key 已启用。"); await refresh(false);
@@ -171,6 +185,22 @@
     } catch (_) { el("secret-value").focus(); el("secret-value").select(); el("copy-status").textContent = "自动复制不可用，请手动复制选中的密钥。"; }
   };
   el("confirm-cancel").onclick = () => el("confirm").close();
+  el("quota-cancel").onclick = () => el("quota").close();
+  el("quota").addEventListener("close", () => { pendingQuota = null; });
+  el("quota-form").onsubmit = async event => {
+    event.preventDefault();
+    const limits = [];
+    for (const name of ["quota-daily", "quota-weekly"]) {
+      const input = el(name), limit = input.value === "" ? null : Number(input.value);
+      if (limit !== null && (!Number.isSafeInteger(limit) || limit < 0)) { input.setCustomValidity("请输入非负整数。"); input.reportValidity(); input.setCustomValidity(""); return; }
+      limits.push(limit);
+    }
+    const expires = el("quota-expires").value;
+    const submit = el("quota-form").querySelector('[type="submit"]'); submit.disabled = true;
+    try { await api(`api/keys/${pendingQuota}/quota`, {expires_at: expires ? Date.parse(`${expires}+08:00`) / 1000 : null,
+      daily_token_limit: limits[0], weekly_token_limit: limits[1]}); el("quota").close(); message("有效期和限额已保存。"); await refresh(false); }
+    catch (e) { el("quota-message").textContent = e.message; el("quota-message").dataset.error = "true"; } finally { submit.disabled = false; }
+  };
   el("confirm-delete").onclick = async () => {
     if (!pendingDelete) return; el("confirm-delete").disabled = true;
     try { await api(`api/keys/${pendingDelete}/delete`, {}); el("confirm").close(); message("Key 已删除，历史用量已保留。"); await refresh(false); }

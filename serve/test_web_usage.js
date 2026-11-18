@@ -82,6 +82,11 @@ assert.doesNotMatch(graph, /<script>|NaN|Infinity/);
 assert.doesNotMatch(graph, /<title>/, "custom tooltips must not compete with the delayed native tooltip");
 const tooltipData = svg => Array.from(svg.matchAll(/data-usage="([^"]+)"/g), match => JSON.parse(match[1]
   .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")));
+for (const [value, label] of [[1e12, "1T"], [9e15, "9P"], [9e18, "9E"]]) {
+  const large = chart(times, [{name: "large", series: [{time: times[0], total_tokens: value}]}], "total_tokens");
+  assert(large.includes(`text-anchor="end">${label}</text>`), `large axis label should use ${label}`);
+  assert.equal(tooltipData(large)[0].total, value, "axis abbreviation must preserve the full tooltip value");
+}
 const daily = tooltipData(graph);
 assert.equal(daily.length, 3);
 assert.equal(daily[1].time, "2026-11-02");

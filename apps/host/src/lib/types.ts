@@ -219,6 +219,7 @@ export interface ServeRequest {
   model: string;
   cachedTokens?: number | null;
   tps?: number | null;
+  peakTps?: number | null;
   promptTps?: number | null;
   hitRate?: number | null;
   pcieShare?: number | null;
