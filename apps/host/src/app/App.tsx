@@ -13,6 +13,7 @@ import { MOD, handleAppShortcut, runCommand } from '../lib/commands';
 import { useMedia } from '../lib/responsive';
 import { Btn, Dialog, IconBtn, Toasts } from '../components/ui';
 import { Brand } from '../components/Brand';
+import { BridgeDialog } from '../components/BridgeDialog';
 import { ChatScreen } from '../screens/Chat';
 import { lazyScreen, useLoadedModule } from '../lib/lazy-screen';
 // The start screen is Chat. Every other screen loads the first time it is opened (7.1), so the first start reads and runs less code.
@@ -32,6 +33,8 @@ function AppShell() {
     const paletteOpen = useStore((s) => s.paletteOpen);
     const focus = useStore((s) => s.focus);
     const firstRunOpen = useStore((s) => s.setupOpen);
+    const bridge = useStore(s => s.bridge);
+    const [bridgeOpen, setBridgeOpen] = useState(false);
     const setupRef = useRef<HTMLDivElement>(null);
     useEffect(() => {
         bootOnce();
@@ -49,7 +52,7 @@ function AppShell() {
     // First run is a modal over the working shell rather than a takeover: the app
     // is visibly there behind it, which is far less daunting than a blank window
     // demanding five steps before anything appears.
-    const setupOpen = location.route === 'setup' || (!!setup && !setup.complete && !setup.dismissed) || firstRunOpen;
+    const setupOpen = !bridge?.enabled && (location.route === 'setup' || (!!setup && !setup.complete && !setup.dismissed) || firstRunOpen);
     // Hook runs here, after setupOpen exists — see src/lib/focus.ts.
     // The dialogs open once their code has loaded, so they appear and take focus exactly as before.
     const setupCode = useLoadedModule(loadSetup, setupOpen);
@@ -68,6 +71,7 @@ function AppShell() {
           <span className="spacer"/>
           <IconBtn name="new-chat" title={tr("New chat")} onClick={() => runCommand('new')}/>
         </div>
+        <div className="bridge-bar"><Btn size="sm" icon="link" active={!!bridge?.enabled} title={bridge?.error ?? undefined} onClick={() => setBridgeOpen(true)}>{tr(!bridge?.enabled ? "Bridge" : bridge.status === 'error' ? "Bridge error" : bridge.status === 'idle' ? "Bridge idle" : "Bridge on")}</Btn></div>
         <ConnectionBar />
         {tr(focus && location.route === 'chat' ? <FocusBar /> : null)}
         {tr(!ready ? <BootSkeleton /> : <Suspense fallback={<BootSkeleton />}><RouteView route={routeShown}/></Suspense>)}
@@ -79,9 +83,11 @@ function AppShell() {
       {tr(setupShown ? (<div className="setupmodal" role="dialog" aria-modal="true" aria-label={tr("Set up Strata")}>
           <div className="scrim" data-open="true" aria-hidden="true"/>
           <div className="setupmodal__surface" ref={setupRef}>
+            <div className="bridge-setup-entry"><Btn size="sm" icon="link" onClick={() => setBridgeOpen(true)}>{tr("Connect to another server")}</Btn></div>
             {setupCode ? <setupCode.SetupScreen /> : null}
           </div>
         </div>) : null)}
+      <BridgeDialog open={bridgeOpen} onClose={() => setBridgeOpen(false)}/>
       <Toasts />
     </div>);
 }
@@ -124,14 +130,15 @@ function FocusBar() {
     const mac = MOD === '⌘';
     const native = useNative(), nativeCurrent = native?.instances.find(i => i.id === native.defaultId);
     const library = useStore((s) => s.library);
+    const bridge = useStore(s => s.bridge);
     const monitor = useStore((s) => s.monitor);
     const model = library?.variants.find((v) => v.id === library.loaded) ?? null;
-    const phase = nativeCurrent ? (nativeCurrent.status === 'ready' ? nativeCurrent.phase : nativeCurrent.status) : monitor?.phase ?? 'idle';
-    const state = ['error', 'unavailable'].includes(phase) ? 'idle' : phase === 'generating' || phase === 'reading' || phase === 'thinking' ? 'busy' : model || nativeCurrent ? 'ready' : 'idle';
+    const phase = bridge?.enabled ? (bridge.status === 'connected' ? 'ready' : bridge.status === 'error' ? 'error' : 'idle') : nativeCurrent ? (nativeCurrent.status === 'ready' ? nativeCurrent.phase : nativeCurrent.status) : monitor?.phase ?? 'idle';
+    const state = ['error', 'unavailable'].includes(phase) || (bridge?.enabled && phase === 'idle') ? 'idle' : phase === 'generating' || phase === 'reading' || phase === 'thinking' ? 'busy' : bridge?.enabled || model || nativeCurrent ? 'ready' : 'idle';
     return (<div className="focusbar" data-state={state}>
       <span className="focusbar__dot"/>
       <span className="strong" style={{ color: 'var(--st-ink)' }}>
-        {tr(nativeCurrent?.label ?? model?.label ?? 'No model loaded')}
+        {tr(bridge?.enabled ? bridge.model?.name ?? bridge.model?.id ?? 'Bridge' : nativeCurrent?.label ?? model?.label ?? 'No model loaded')}
       </span>
       <span>
         {tr(phase === 'reading'
@@ -140,7 +147,7 @@ function FocusBar() {
                 ? `generating · ${(nativeCurrent ? nativeCurrent.metrics?.live?.tok_s ?? 0 : monitor?.outputTps ?? 0).toFixed(1)} tok/s`
                 : phase === 'thinking'
                     ? 'thinking'
-                    : phase === 'error' ? 'engine error' : phase === 'unavailable' ? 'status unavailable' : phase === 'loading' ? 'loading' : model || nativeCurrent ? 'ready' : 'no model loaded')}
+                    : phase === 'error' ? (bridge?.enabled ? 'Error' : 'engine error') : bridge?.enabled && phase === 'idle' ? 'Idle' : phase === 'unavailable' ? 'status unavailable' : phase === 'loading' ? 'loading' : bridge?.enabled || model || nativeCurrent ? 'ready' : 'no model loaded')}
       </span>
       <span className="spacer"/>
       {/* Grouped, so each hint reads as one instruction rather than a row of

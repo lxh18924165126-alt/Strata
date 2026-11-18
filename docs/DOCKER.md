@@ -273,6 +273,22 @@ It prints `http://127.0.0.1:8080`, which is the address *inside* the container; 
 (`-p 127.0.0.1:9000:8080` makes it `http://127.0.0.1:9000`). If your coding app runs on your computer, install the `strata`
 Terminal there ([TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md)) and run `strata connect opencode --url http://HOST:8080 --key <your key>`.
 
+## Use the model from another Strata desktop
+
+Keep the Docker port bound to `127.0.0.1` on the model computer. On the computer running the desktop app, open an SSH
+tunnel and leave it running. Replace `user@model-host` with your SSH login and use the published host port in place of `8080` if it differs.
+
+```sh
+ssh -NT -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8080 user@model-host
+```
+
+In the desktop app, open **Bridge mode** at the top of the window or during first-run setup. Enter `http://127.0.0.1:18080/v1`
+and the model server's API key. Test the connection, choose a model, and enable the bridge. The desktop remembers this choice
+when reopened and skips loading a local model. If the tunnel closes, reopen it and test the connection again.
+
+Apps on the desktop computer can keep using its existing local Strata API address and local API key. The desktop's Monitor
+shows usage reported for requests it forwarded during the current run. A disconnected request may report only part of its usage.
+
 ## Watch it and stop it
 
 ```sh

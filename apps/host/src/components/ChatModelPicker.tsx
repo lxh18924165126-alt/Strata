@@ -12,7 +12,8 @@ import { contextTokens } from '../lib/experience';
 import { nativeAction, useNative } from '../lib/native';
 /** The loaded model is shared by all chats; switching uses the existing lifecycle gates. */
 export function ChatModelPicker() {
-    const native = useNative(), remote = useStore(s => s.remoteModel);
+    const native = useNative(), remote = useStore(s => s.remoteModel), bridge = useStore(s => s.bridge);
+    if (bridge?.enabled) return <span className="chat-model-badge"><Icon name="link" size={16}/><span>{bridge.model?.name ?? bridge.model?.id ?? tr("Bridge")}</span></span>;
     return native?.instances.length && !remote ? <NativeChatModelPicker /> : <LegacyChatModelPicker />;
 }
 function NativeChatModelPicker() {

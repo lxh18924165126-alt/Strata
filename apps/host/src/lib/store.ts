@@ -1,3 +1,4 @@
+import type { BridgeState } from './types';
 import { workspaceIdForSession } from './session-workspace';
 import { shortTitle } from './title-text';
 import { DEFAULT_CONTENT_FS, DEFAULT_UI_SCALE, SIZE_DEFAULTS_VERSION, savedSizes } from './default-sizes';
@@ -114,6 +115,7 @@ export interface AppState {
   imageModels: ImageModelLibrary | null;
   runtime: RuntimeModels | null;
   providers: ModelProviders | null;
+  bridge: BridgeState | null;
   remoteModel: RemoteModelSelection | null;
   engine: EngineConfig | null;
   serving: ServingState | null;
@@ -319,6 +321,7 @@ let state: AppState = {
   imageModels: null,
   runtime: null,
   providers: null,
+  bridge: null,
   /** The open chat's API model, or null for the local model (the default for every chat). */
   remoteModel: null,
   engine: null,
@@ -380,6 +383,12 @@ export function setConfigDraft(configDraft: string | null) {
     if (configDraft === null) sessionStorage.removeItem('strata.config-draft.v1');
     else sessionStorage.setItem('strata.config-draft.v1', configDraft);
   } catch { /* Keep the session draft even when browser storage is unavailable. */ }
+}
+
+export async function updateBridge(value: { enabled: false } | { enabled: true; baseUrl: string; apiKey?: string; modelId: string }) {
+  const bridge = await api.patch<BridgeState>('/api/bridge', value);
+  set({ bridge });
+  return bridge;
 }
 
 export function setNavOpen(navOpen: boolean) { set({ navOpen }); }
@@ -857,6 +866,9 @@ function applyEvent(e: StreamEvent) {
     case 'engine':
       set({ engine: data as unknown as EngineConfig });
       break;
+    case 'bridge':
+      set({ bridge: data as unknown as BridgeState });
+      break;
     case 'serving':
       set({ serving: newestServingState(state.serving, data as unknown as ServingState) });
       break;
@@ -926,16 +938,18 @@ export async function bootstrap() {
       imageModels: soft<ImageModelLibrary>('/api/image-models'),
       runtime: soft<RuntimeModels>('/api/runtime'),
     };
-    const [setup, library, engine, serving, workspaceState] = await Promise.all([
+    const [setup, library, engine, serving, workspaceState, bridge] = await Promise.all([
       getWithRetry<SetupState>('/api/setup'),
       getWithRetry<ModelLibrary>('/api/models'),
       getWithRetry<EngineConfig>('/api/engine'),
       getWithRetry<ServingState>('/api/serving'),
       getWithRetry<{ workspaces: Workspace[] }>('/api/workspaces'),
+      getWithRetry<BridgeState>('/api/bridge'),
     ]);
     set({
       ready: true,
       setup,
+      bridge,
       library: libraryResponse(library),
       engine,
       serving: newestServingState(state.serving, serving),
@@ -1967,11 +1981,11 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
   // Whatever sent this (the box, a loop, a plan): with no model to answer, say so in plain words and start nothing.
   if (state.connection === 'live' && !reattach) {
     // The first read of the engine's state has not come back yet: do not say "no model" about something not known yet, and do not send.
-    if (!nativeState() && !state.remoteModel && !state.library?.loaded) { pushToast('info', 'Still starting up', 'Strata is still checking your models. Try again in a moment.'); return; }
-    const why = noModelNotice(nativeState(), { remote: !!state.remoteModel, libraryLoaded: !!state.library?.loaded });
+    if (!nativeState() && !state.bridge?.enabled && !state.remoteModel && !state.library?.loaded) { pushToast('info', 'Still starting up', 'Strata is still checking your models. Try again in a moment.'); return; }
+    const why = noModelNotice(nativeState(), { remote: !!state.bridge?.enabled || !!state.remoteModel, libraryLoaded: !!state.library?.loaded });
     if (why) { pushToast('info', why.title, why.message); return; }
   }
-  const pictureCheck=pictureStatus(nativeState(),state.remoteModel,state.providers);
+  const pictureCheck=pictureStatus(nativeState(),state.remoteModel,state.providers,state.bridge);
   if(!reattach&&pendingChatPhotos(state.activeSession).length&&!pictureCheck.ok){pushToast('error','This model cannot read pictures',tr(pictureCheck.message));return;}
   const pictures=reattach?[]:takeChatPhotos(state.activeSession);
   const body=text.trim()||(pictures.length?'Describe this picture.':'');

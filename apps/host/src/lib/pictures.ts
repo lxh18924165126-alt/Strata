@@ -1,5 +1,5 @@
 import type { NativeState } from './native';
-import type { ModelProviders, RemoteModelSelection } from './types';
+import type { BridgeState, ModelProviders, RemoteModelSelection } from './types';
 
 /**
  * Can the model that answers this chat take a picture, and if not, what does the person do next?
@@ -13,7 +13,8 @@ export type PictureStatus =
   | { ok: true }
   | { ok: false; why: 'none' | 'local-off' | 'local-cannot' | 'api-off' | 'api-style'; message: string; openModels: boolean };
 
-export function pictureStatus(native: NativeState | null, remote: RemoteModelSelection | null, providers: ModelProviders | null): PictureStatus {
+export function pictureStatus(native: NativeState | null, remote: RemoteModelSelection | null, providers: ModelProviders | null, bridge?: BridgeState | null): PictureStatus {
+  if (bridge?.enabled) return bridge.model?.vision === true ? { ok: true } : { ok: false, why: 'api-off', openModels: false, message: 'This bridge model does not report picture support. Remove the picture or choose another model.' };
   if (remote) {
     const connection = providers?.connections.find(c => c.id === remote.connectionId);
     const model = connection?.models.find(m => m.id === remote.modelId);

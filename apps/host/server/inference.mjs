@@ -236,7 +236,7 @@ export async function streamChat({ message, history = [], systemPrompt = '', mod
 
 /* --------------------------------------------------------- real engine path --- */
 
-export async function proxyCompletion({ baseUrl, message, history = [], systemPrompt = '', onFrame, signal, supervised = false, engine,modelId='local',authorization,images=[],extra={} }) {
+export async function proxyCompletion({ baseUrl, message, history = [], systemPrompt = '', onFrame, signal, supervised = false, engine,modelId='local',authorization,images=[],extra={},reportedOnly=false }) {
   const started = Date.now();
   engine?.beginReading(0, engine.variantId);
   const messages = [
@@ -282,7 +282,7 @@ export async function proxyCompletion({ baseUrl, message, history = [], systemPr
      (one per streamed chunk, or characters / 4 when the server batches) over the time since the first token, never the visible
      answer over the whole wall time. The engine's own numbers replace it when the answer is done. */
   let chunks=0,chars=0,lastStats=0;
-  const liveStats=()=>{if(supervised||firstTokenAt===null)return;const now=Date.now();if(now-lastStats<400)return;const seconds=(now-firstTokenAt)/1000;if(seconds<.5)return;lastStats=now;
+  const liveStats=()=>{if(reportedOnly||supervised||firstTokenAt===null)return;const now=Date.now();if(now-lastStats<400)return;const seconds=(now-firstTokenAt)/1000;if(seconds<.5)return;lastStats=now;
    const tokens=chars/Math.max(1,chunks)<8?chunks:Math.ceil(chars/4);onFrame({type:'stats',tokensOut:tokens,tps:Number((tokens/seconds).toFixed(1)),source:'stream'});};
 
   const metricsTicker = supervised
@@ -354,7 +354,7 @@ export async function proxyCompletion({ baseUrl, message, history = [], systemPr
   signal?.throwIfAborted();
   const durationMs = Date.now() - started;
   const decodeMs = firstTokenAt ? Date.now() - firstTokenAt : durationMs;
-  const tps = Number.isFinite(timings?.predicted_per_second)?timings.predicted_per_second:out !== null && decodeMs > 0 ? Number((out / (decodeMs / 1000)).toFixed(1)) : null;
+  const tps = Number.isFinite(timings?.predicted_per_second)?timings.predicted_per_second:!reportedOnly && out !== null && decodeMs > 0 ? Number((out / (decodeMs / 1000)).toFixed(1)) : null;
   const usageSource = promptTokens !== null && out !== null ? 'reported' : 'unavailable';
 
   const result = { tokensIn: promptTokens, tokensOut: out, cachedTokens, tps, promptTps:Number.isFinite(timings?.prompt_per_second)?timings.prompt_per_second:null,hitRate:Number.isFinite(timings?.hit_rate)?timings.hit_rate:null,pcieShare:Number.isFinite(timings?.pcie_share)?timings.pcie_share:null,finishReason,durationMs, usageSource, ttftMs: firstTokenAt === null ? null : firstTokenAt - started };

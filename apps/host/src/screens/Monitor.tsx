@@ -49,6 +49,7 @@ function MonitorMetric({ label, icon, value, unit, sub, chart, source, secondary
 function requestStatus(request: ServeRequest) {
     if (request.state === 'error')
         return 'Error';
+    if (request.cancelRequested) return 'Cancelling…';
     if (request.state === 'queued')
         return 'Queued';
     if (request.state === 'generating')
@@ -59,15 +60,28 @@ function requestStatus(request: ServeRequest) {
 }
 export function MonitorScreen() {
     const native = useNative();
+    const bridge = useStore(s => s.bridge);
     // While this screen is open and visible the host reads the graphics card every 3 s; otherwise it asks only every 30 s (#4066).
     useEffect(() => {
+        if (bridge?.enabled) return;
         const ask = () => { if (typeof document === 'undefined' || document.visibilityState !== 'hidden')
             void api.get('/api/monitor?drives=1').catch(() => undefined); };
         ask();
         const timer = setInterval(ask, 10000);
         return () => clearInterval(timer);
-    }, []);
+    }, [bridge?.enabled]);
+    if (bridge?.enabled) return <BridgeMonitor/>;
     return <LegacyMonitorScreen native={native?.instances.length ? native : null}/>;
+}
+function BridgeMonitor() {
+    const bridge = useStore(s => s.bridge), serving = useStore(s => s.serving);
+    const totals = serving?.bridgeTotals;
+    const requests = serving?.requests.filter(r => r.source === 'bridge') ?? [];
+    return <Screen title={tr("Monitor")}><div className="stack stack--lg">
+        <section className="st-card"><h2 className="h4">{tr("Bridge status")}</h2><p>{bridge?.model?.name ?? bridge?.model?.id} · {tr(bridge?.status === 'connected' ? 'Connected' : bridge?.status === 'error' ? 'Error' : 'Idle')}</p>{bridge?.error ? <p className="small inline-error" role="alert">{bridge.error}</p> : null}</section>
+        <section className="st-card"><h2 className="h4">{tr("Bridge usage")}</h2>{totals ? <><dl className="summary-list"><div><dt>{tr("Requests")}</dt><dd>{totals.requests}</dd></div><div><dt>{tr("Completed")}</dt><dd>{totals.completed}</dd></div><div><dt>{tr("Failed")}</dt><dd>{totals.failed}</dd></div><div><dt>{tr("Tokens in / out")}</dt><dd>{tokens(totals.tokensIn)} / {tokens(totals.tokensOut)}</dd></div><div><dt>{tr("Cached tokens")}</dt><dd>{tokens(totals.cachedTokens)}</dd></div></dl><p className="small muted">{tr("Usage reported by the upstream server. Requests with incomplete usage: {0}", [totals.incomplete])}</p></> : <p className="muted">{tr("Waiting for bridge usage…")}</p>}</section>
+        <section className="st-card monitor-requests"><h2 className="h4">{tr("Recent bridge requests")}</h2><div className="st-tablewrap monitor-request-table"><table className="st-table"><thead><tr><th>{tr("Time")}</th><th>{tr("Client")}</th><th>{tr("Protocol / endpoint")}</th><th>{tr("Model")}</th><th>{tr("Status")}</th><th className="num">{tr("Prompt")}</th><th className="num">{tr("Reused")}</th><th className="num">{tr("Output")}</th><th className="num">{tr("Tok/s")}</th><th className="num">{tr("Duration")}</th></tr></thead><tbody>{requests.length ? requests.map(r => <tr key={r.id}><td>{new Date(r.at).toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</td><td>{r.client}</td><td>{r.endpoint}</td><td>{r.model}</td><td><span className="request-status" data-state={r.state}>{tr(requestStatus(r))}</span>{r.usageIncomplete ? <small className="monitor-request-source xs muted">{tr('Usage incomplete')}</small> : null}</td><td className="num">{number(r.tokensIn)}</td><td className="num">{number(r.cachedTokens)}</td><td className="num">{number(r.tokensOut)}</td><td className="num">{number(r.tps, 1)}</td><td className="num">{r.durationMs ? duration(r.durationMs) : '—'}</td></tr>) : <tr><td colSpan={10} className="muted">{tr("No bridge requests yet.")}</td></tr>}</tbody></table></div></section>
+    </div></Screen>;
 }
 function LegacyMonitorScreen({ native }: {
     native: NativeState | null;

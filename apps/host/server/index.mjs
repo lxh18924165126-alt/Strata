@@ -83,6 +83,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { nativeGateway } from './native-gateway.mjs';
 import { proxyCompletion } from './inference.mjs';
 import { apiPath } from './api-paths.mjs';
+import { createBridgeSettings } from './bridge-settings.mjs';
+import { forwardBridge } from './bridge-upstream.mjs';
 import { findFreePort, listenProblem } from './ports.mjs';
 import { validateChatImages } from './chat-images.mjs';
 import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf } from './timeskip.mjs';
@@ -121,6 +123,16 @@ const WORKSPACE_NAME = process.env.STRATA_WORKSPACE ? basename(WORKSPACE) : 'Str
 const insideApp = path => { const rel = relative(ROOT, resolve(path)); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)); };
 
 const hub = new EventHub();
+const bridge = createBridgeSettings({ directory: store.DATA_DIR, changed: view => hub.send('bridge', view) });
+const BRIDGE_CONNECTION = 'strata-bridge';
+const bridgeToken = randomBytes(24).toString('hex');
+const loopback = host => /^(?:localhost\.?|127\.(?:\d+\.){2}\d+|\[?::1\]?|::ffff:127\.(?:\d+\.){2}\d+)$/i.test(host);
+const hostUrl = `http://${HOST === '::1' ? '[::1]' : loopback(HOST) ? HOST : '127.0.0.1'}:${PORT}`;
+const bridgeBase = channel => `${hostUrl}/api/internal/bridge/${channel}/v1`;
+const bridgeChoice = () => ({ connectionId: BRIDGE_CONNECTION, modelId: bridge.config().model.id });
+let bridgeChanging = false;
+let modelRequests = 0;
+let accessOperations = 0;
 /** The chats, as files in the profile's data folder (chat-store.mjs). */
 const chatStore = createChatStore({ dir: store.DATA_DIR, privateDir: makePrivateDir });
 const modelProviders = createModelProviders({ directory: store.DATA_DIR, knownThinks: (connection, modelId) => visionProbe.knownThinks(connection, modelId), changed: value => hub.send('providers', withPictureAnswers(value)) });
@@ -181,7 +193,7 @@ function withPictureAnswers(list) {
   const secrets = new Map(modelProviders.withSecrets().map(c => [c.id, c]));
   const connections = (list.connections ?? []).map(c => ({ ...c, models: c.models.map(m => {
     const asked = visionProbe.known(c, m.id);
-    if ((m.vision == null || m.reasoning == null) && asked === undefined && c.protocol === 'openai-chat' && secrets.has(c.id)) void visionProbe.check(secrets.get(c.id), m.id).catch(() => {});
+    if (!bridge.config().enabled && !bridgeChanging && (m.vision == null || m.reasoning == null) && asked === undefined && c.protocol === 'openai-chat' && secrets.has(c.id)) void visionProbe.check(secrets.get(c.id), m.id).catch(() => {});
     // Pictures are on unless the person or the server says no; a model that thinks says so too (OpenRouter's supported_parameters).
     return { ...m, reads: readsPicturesByDefault(m, asked), thinks: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null };
   }) }));
@@ -212,7 +224,7 @@ const agent = createAgentBridge({
   // The installer ships the Harness next to the host (<install>/host/server -> <install>/harness).
   bundledDir: resolve(HERE, '..', '..', 'harness'),
   defaultLocalId: () => native.defaultInstanceId(),
-  localInstances: () => native.readyInstances().map(i => ({
+  localInstances: () => bridge.config().enabled ? [] : native.readyInstances().map(i => ({
     id: i.id, label: i.label, baseUrl: `http://127.0.0.1:${i.port}/v1`, modelId: i.apiModelId,
     context: i.metrics?.engine?.max_context ?? i.context ?? undefined, key: i.key, vision: i.vision,
     // The engine's request slots: helper agents never outnumber them.
@@ -220,7 +232,10 @@ const agent = createAgentBridge({
     // The tool servers set up for this model (Settings, Tools): the agent connects to the same ones.
     mcpServers: i.mcpServers,
   })),
-  connections: () => modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
+  connections: () => bridge.config().enabled ? [{
+    id: BRIDGE_CONNECTION, name: 'Strata bridge', baseUrl: bridgeBase('agent'), protocol: 'openai-chat',
+    apiKey: bridgeToken, models: [{ ...bridge.config().model, vision: bridge.config().model.vision === true }],
+  }] : modelProviders.withSecrets().map(c => ({ ...c, models: c.models.map(m => ({ ...m, vision: readsPicturesByDefault(m, visionProbe.known(c, m.id)), reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null })) })),
   log: line => console.log(line),
 });
 let storageChanging = false;
@@ -257,14 +272,16 @@ function runtimeState(){
   return runtimeModels.state();
 }
 
-const startupModelId = process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
+const startupModelId = !bridge.config().enabled && process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
 if (startupModelId) {
   monitor.setModel(startupModelId);
   const lastId = startupModelId;
   setTimeout(() => {
+    if (bridge.config().enabled || bridgeChanging) return;
     const v = variant(lastId);
     if (!v || !models.isOnDisk(lastId)) return;
     console.log(`autostart    ·  loading ${v.label}`);
+    modelOperations++;
     void models
       .load(lastId, {
         hardware: boot,
@@ -278,7 +295,8 @@ if (startupModelId) {
           }
         },
       })
-      .catch((err) => console.error('autostart failed:', err.message));
+      .catch((err) => console.error('autostart failed:', err.message))
+      .finally(() => { modelOperations--; });
   }, 700);
 }
 const backend = await detectBackend({ force: true });
@@ -612,7 +630,8 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
   const write = frame => { if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(frame)}\n`); };
   const cwd = chatFolders.get(chatId) ?? (workspaceId ? workspaces.find(w => w.id === workspaceId)?.path : null) ?? WORKSPACE;
   let choice, instance = null;
-  if (body.remoteModel) {
+  if (bridge.config().enabled) choice = bridgeChoice();
+  else if (body.remoteModel) {
     choice = { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) };
     // Does this server read pictures? Asked before the agent is built, so a picture is never sent to one that cannot.
     const own = modelProviders.withSecrets().find(c => c.id === choice.connectionId);
@@ -653,6 +672,26 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
 }
 
 async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0 }) {
+  if (bridge.config().enabled) {
+    const { model } = bridge.config();
+    const applied = selectSkills(skillState, message, workspaceId);
+    try {
+      return await proxyCompletion({
+        baseUrl: bridgeBase('chat'), authorization: bridgeToken, modelId: model.id, message, history, images, signal, reportedOnly: true,
+        extra: { reasoning_effort: ({ off: 'none', max: 'high' }[String(thinking).toLowerCase()] ?? String(thinking).toLowerCase()),
+          ...(thinkingBudget > 0 && String(thinking).toLowerCase() !== 'off' ? { reasoning_budget_tokens: thinkingBudget } : {}) },
+        systemPrompt: [SYSTEM_PROMPT, skillInstructions(applied)].filter(Boolean).join('\n\n'),
+        onFrame: frame => {
+          if (frame.type === 'start') noteSkillUse(applied);
+          onFrame({ ...frame, model: model.name, contextMax: model.contextMax, remoteModel: true, skills: applied.map(s => s.name) });
+        },
+      });
+    } catch (err) {
+      const error = signal?.aborted ? 'Request cancelled. Partial output is preserved.' : err.message;
+      onFrame({ type: 'error', message: error });
+      return { error };
+    }
+  }
   if (remoteModel) return runRemoteTurn({ selection: remoteModel, message, history, images, thinking, onFrame, signal, workspaceId });
   if(native.hasLive()||nativeModelId){
     let instance;try{instance=native.resolveInstance(nativeModelId??native.state().defaultId);}catch(e){const message=plainNoModel(e.message);onFrame({type:'error',message});return {error:message};}const started=Date.now(),cancel=new AbortController();
@@ -921,6 +960,7 @@ const runAgentTask = createAgentTaskRunner({
   agent, workspace: WORKSPACE,
   // The loaded local model. (STRATA_TASK_REMOTE_MODEL="<connection id>:<model id>" lets a developer or an API-only setup name a saved API model instead.)
   choice: () => {
+    if (bridge.config().enabled) return bridgeChoice();
     try { return { instanceId: native.resolveInstance(native.state().defaultId).id }; } catch { /* no local model is ready */ }
     const [connectionId, ...rest] = String(process.env.STRATA_TASK_REMOTE_MODEL ?? '').split(':');
     return connectionId && rest.length ? { connectionId, modelId: rest.join(':') } : null;
@@ -931,17 +971,21 @@ const tasks = createTaskService({
   write: records => store.update({ tasks: records }),
   notify: task => hub.send('task', { id: task.id, title: task.title, status: task.status, attention: task.attention ?? null, error: task.error ?? null }),
   run: async (task, signal) => {
-    if (agent.status().state !== 'unavailable') { const agentResult = await runAgentTask(task, signal); if (agentResult) return agentResult; }
-    let text = '', failure = null, demo = !models.REAL;
-    await runTurn({ message: task.prompt, signal, client: `Task: ${task.title}`, onFrame: frame => {
-      if (frame.type === 'delta') text += frame.text ?? '';
-      if (frame.type === 'start') demo = !!frame.demo;
-      if (frame.type === 'error') failure = frame.message;
-    }});
-    if (failure) throw new Error(failure);
-    signal.throwIfAborted();
-    if (!text) throw new Error('The model returned no answer.');
-    return { text, demo };
+    if (bridgeChanging) throw new Error('Wait for Strata to finish switching the bridge mode.');
+    modelRequests++;
+    try {
+      if (agent.status().state !== 'unavailable') { const agentResult = await runAgentTask(task, signal); if (agentResult) return agentResult; }
+      let text = '', failure = null, demo = !models.REAL;
+      await runTurn({ message: task.prompt, signal, client: `Task: ${task.title}`, onFrame: frame => {
+        if (frame.type === 'delta') text += frame.text ?? '';
+        if (frame.type === 'start') demo = !!frame.demo;
+        if (frame.type === 'error') failure = frame.message;
+      }});
+      if (failure) throw new Error(failure);
+      signal.throwIfAborted();
+      if (!text) throw new Error('The model returned no answer.');
+      return { text, demo };
+    } finally { modelRequests--; }
   },
 });
 const taskTimer = setInterval(() => tasks.tick(), 15000);
@@ -960,11 +1004,75 @@ await cloudflare.inspect();
 
 /* --------------------------------------------------------------- routing --- */
 
+const bridgePorts = [PORT, sharePort, tunnelPort];
+const bridgePosts = new Set(['/v1/chat/completions', '/v1/responses', '/v1/messages', '/v1/messages/count_tokens']);
+const bridgeNativeJobs = new Set(['load', 'benchmark', 'tune', 'autotune', 'recheck', 'calibrate', 'restart-models']);
+const bridgeModelRoutes = new Set(['/api/chat/stream', '/api/plan/start-goal', '/api/timeskip/start', '/api/internal/timeskip-revise', '/api/tasks/draft']);
+
+function localBridgeRequest(req, url) {
+  if (!loopback(req.socket.remoteAddress ?? '') || !loopback(url.hostname)) return false;
+  if (!req.headers.origin) return true;
+  try { return loopback(new URL(req.headers.origin).hostname); }
+  catch { return false; }
+}
+
+async function changeBridge(req, res) {
+  const body = await readBody(req);
+  if (typeof body?.enabled !== 'boolean') return error(res, 400, 'Choose whether bridge mode is enabled.');
+  const capacity = serving.state();
+  if (bridgeChanging || modelRequests || modelOperations || accessOperations || storageChanging || capacity.stats.running || capacity.stats.waiting || agent.runningTurns().length ||
+      native.state().jobs.some(job => job.state === 'running') || models.directoryBusy() || imageModels.busy() ||
+      trials.size || forkTs.list().some(run => run.finishedAt === null)) {
+    return error(res, 409, 'Finish or cancel active model requests and jobs before switching bridge mode.');
+  }
+  if (body.enabled && capacity.access.otherDevices) return error(res, 409, 'Close local sharing and public tunnels before enabling bridge mode. The app must listen on this computer only.');
+  bridgeChanging = true;
+  try {
+    if (!body.enabled) {
+      await agent.close();
+      return json(res, 200, bridge.disable());
+    }
+    const { baseUrl, apiKey, models: available } = await bridge.check(body, bridgePorts);
+    const model = body.modelId ? available.find(row => row.id === body.modelId) : available.length === 1 ? available[0] : null;
+    if (!model) return error(res, 400, 'Choose a text model returned by the bridge server.');
+    await agent.close();
+    for (const instance of native.state().instances) await native.unload(instance.id);
+    if (models.REAL && supervisor.status().pid) {
+      await models.unload();
+      engine.markStopped();
+      monitor.idle('Model unloaded');
+    } else if (!models.REAL) {
+      for (const instance of runtimeModels.state().instances) runtimeModels.unload(instance.id);
+    }
+    return json(res, 200, bridge.save({ enabled: true, baseUrl, apiKey, model }));
+  } catch (err) {
+    return error(res, 400, err.message);
+  } finally { bridgeChanging = false; }
+}
+
+async function bridgeForward(req, res, path, client) {
+  if (bridgeChanging) return error(res, 503, 'Wait for Strata to finish switching the bridge mode.');
+  const config = bridge.config();
+  if (!config.enabled) return error(res, 503, 'Bridge mode is off.');
+  modelRequests++;
+  try {
+    let body;
+    try { body = await readBody(req, 12 * 1024 * 1024); }
+    catch (err) { return error(res, 400, err.message); }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return error(res, 400, 'Body must be a JSON object.');
+    return await forwardBridge({ req, res, path, body, client, serving, config: { ...config, blockedPorts: bridgePorts }, onConnection: message => bridge.connection(message, config) });
+  } finally { modelRequests--; }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = requestUrl(req);
   if (!url) return badRequest(res);   // #4397: a bad Host or request target is a 400, never an unhandled rejection
   const path = url.pathname;
   const method = req.method ?? 'GET';
+  const bridgeControl = path === '/api/bridge' || path.startsWith('/api/bridge/');
+  if ((bridgeControl || bridgeChanging || bridge.config().enabled) && (path.startsWith('/api/') || path.startsWith('/v1/')) && !localBridgeRequest(req, url)) {
+    return error(res, 403, 'Bridge mode is available on this computer only.');
+  }
 
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', 'content-type, authorization, x-api-key, x-strata-client');
@@ -981,10 +1089,20 @@ const server = http.createServer(async (req, res) => {
       if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) return error(res, 403, 'Open the local Strata app to use host controls.');
     }
     if (path.startsWith('/api/')) {
-      const modelOperation = !['GET', 'OPTIONS'].includes(method) && /^\/api\/(models|local-models|runtime|image-models|engine|native)(\/|$)/.test(path) && !['/api/runtime/plan', '/api/engine/validate', '/api/local-models/inspect'].includes(path);
+      const modelOperation = !['GET', 'OPTIONS'].includes(method) && /^\/api\/(models|local-models|runtime|image-models|engine|engines|native)(\/|$)/.test(path) && !['/api/runtime/plan', '/api/engine/validate', '/api/local-models/inspect'].includes(path);
+      const modelRequest = method === 'POST' && bridgeModelRoutes.has(path);
+      const accessOperation = method === 'POST' && ['/api/serving/share', '/api/serving/tunnel'].includes(path);
+      if (bridgeChanging && (modelOperation || modelRequest || accessOperation)) return error(res, 409, 'Wait for Strata to finish switching the bridge mode.');
+      if (bridge.config().enabled && method === 'POST' && (path === '/api/runtime/load' || path === '/api/engine/restart' || /^\/api\/models\/[^/]+\/load$/.test(path))) return error(res, 409, 'Turn off bridge mode before loading a model on this computer.');
       if (modelOperation) modelOperations++;
+      if (modelRequest) modelRequests++;
+      if (accessOperation) accessOperations++;
       try { return await api(req, res, path, method, url); }
-      finally { if (modelOperation) modelOperations--; }
+      finally {
+        if (modelOperation) modelOperations--;
+        if (modelRequest) modelRequests--;
+        if (accessOperation) accessOperations--;
+      }
     }
     if (path.startsWith('/v1/')) {
       if (storageChanging && method !== 'GET') return error(res, 409, 'Wait for the model folder check to finish.');
@@ -999,6 +1117,29 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function api(req, res, path, method, url) {
+  if (path === '/api/bridge' && method === 'GET') return json(res, 200, bridge.state());
+  if (path === '/api/bridge' && method === 'PATCH') return changeBridge(req, res);
+  if (path === '/api/bridge/test' && method === 'POST') {
+    const body = await readBody(req);
+    const current = bridge.config();
+    const checkingCurrent = current.enabled && body?.baseUrl === current.baseUrl && !body.apiKey;
+    try {
+      const { baseUrl, models } = await bridge.check(body, bridgePorts);
+      if (checkingCurrent) bridge.connection(models.some(model => model.id === current.model.id) ? null : 'The bridge model is unavailable.', current);
+      return json(res, 200, { baseUrl, models });
+    } catch (err) {
+      if (checkingCurrent) bridge.connection(err.message, current);
+      return error(res, 400, err.message);
+    }
+  }
+  const bridgeChannel = /^\/api\/internal\/bridge\/(chat|agent)(\/v1\/.*)$/.exec(path);
+  if (bridgeChannel) {
+    const auth = req.headers.authorization;
+    if (!sameSecret(auth, `Bearer ${bridgeToken}`)) return error(res, 403, 'This route is for the Strata host only.');
+    const canonical = apiPath(bridgeChannel[2].replace(/\/+$/, ''));
+    if (method !== 'POST' || !bridgePosts.has(canonical)) return error(res, 404, 'Unknown bridge endpoint.');
+    return bridgeForward(req, res, canonical, bridgeChannel[1] === 'agent' ? 'Strata assistant' : 'Strata desktop');
+  }
   if(path==='/api/fonts'&&method==='GET')return json(res,200,await systemFonts());
   // --- chats: one file each in the data folder -----------------------------
   // Not held back by a model folder move: saving a chat has nothing to do with the models. A page must name itself (x-strata-client), which
@@ -1061,7 +1202,12 @@ async function api(req, res, path, method, url) {
   if(path==='/api/native/models-folder/resume'&&method==='POST'){const body=await readBody(req);return json(res,202,await native.finishInterruptedMove({stopRunning:body.stopRunning===true}));}
   if(path==='/api/native/models-folder/leave'&&method==='POST')return json(res,200,await native.leaveInterruptedMove());
   if(path==='/api/native/plan'&&method==='POST')return json(res,200,await native.plan(await readBody(req)));
-  if(path==='/api/native/operations'&&method==='POST'){if(storageChanging)return error(res,409,'Wait for the model folder check to finish.');const body=await readBody(req);return json(res,202,native.operation(body.kind,body.args));}
+  if(path==='/api/native/operations'&&method==='POST'){
+    if(storageChanging)return error(res,409,'Wait for the model folder check to finish.');
+    const body=await readBody(req);
+    if(bridge.config().enabled && (bridgeNativeJobs.has(body.kind) || (body.kind === 'install' && body.args?.loadAfter))) return error(res,409,'Turn off bridge mode before running a model on this computer.');
+    return json(res,202,native.operation(body.kind,body.args));
+  }
   if(path==='/api/native/engine-restart/dismiss'&&method==='POST')return json(res,200,native.dismissRestart());
   if(path==='/api/native/logs'&&method==='GET')return json(res,200,{logs:native.logs()});
   if(path==='/api/native/logs/save'&&method==='POST'){
@@ -1194,7 +1340,8 @@ async function api(req, res, path, method, url) {
       if (resolve(cwd) === resolve(ROOT) || resolve(cwd).startsWith(resolve(ROOT) + sep)) return error(res, 400, 'Time-skip works on a folder of your own. Choose a workspace folder for this chat, then try again.');
       if (measureFolder(cwd).tooBig) return error(res, 400, 'This folder is too big to try a change on a copy. Open a smaller folder for this chat, then try again.');
       let choice, slots = 1;
-      if (body.remoteModel?.connectionId && body.remoteModel?.modelId) { choice = { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) };
+      if (bridge.config().enabled) choice = bridgeChoice();
+      else if (body.remoteModel?.connectionId && body.remoteModel?.modelId) { choice = { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) };
         { const own = modelProviders.withSecrets().find(c => c.id === choice.connectionId); if (own && own.protocol === 'openai-chat') await visionProbe.check(own, choice.modelId); } slots = Number(body.slots) >= 1 ? Math.floor(Number(body.slots)) : 1; }
       else { try { const inst = native.resolveInstance(native.state().defaultId); choice = { instanceId: inst.id }; slots = inst.metrics?.live?.slots?.length || inst.parallel || 1; } catch { return error(res, 503, 'Load a model first, then try Time-skip again.'); } }
       const chatId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : null;
@@ -1253,7 +1400,7 @@ async function api(req, res, path, method, url) {
     const root = resolve(timeskip.stateDir());
     if (!cwd || !resolve(cwd).startsWith(root + sep)) return error(res, 400, 'That folder is not part of a Time-skip run.');
     const runId = resolve(cwd).slice(root.length + 1).split(sep)[0];
-    const chosen = timeskipChoices.get(runId) ?? (() => { try { return { instanceId: native.resolveInstance(native.state().defaultId).id }; } catch { return null; } })();
+    const chosen = bridge.config().enabled ? bridgeChoice() : timeskipChoices.get(runId) ?? (() => { try { return { instanceId: native.resolveInstance(native.state().defaultId).id }; } catch { return null; } })();
     if (!chosen) return error(res, 503, 'Load a model first, then try Time-skip again.');
     const chatId = `timeskip:${randomBytes(6).toString('hex')}`;
     // The answer is a stream that starts at once and carries a beat every 15 s: a turn on a slow computer can run for many minutes with
@@ -1304,14 +1451,14 @@ async function api(req, res, path, method, url) {
     const description = String(body.description ?? '').trim().slice(0, 12000);
     if (!description) return error(res, 400, 'Describe the task first.');
     let draft = { title: description.slice(0, 70), prompt: description, frequency: /week/i.test(description) ? 'weekly' : /hour/i.test(description) ? 'hourly' : 'daily', at: '09:00', weekday: 1, timeZone: body.timeZone ?? 'UTC', enabled: true };
-    if (models.REAL) {
+    if (models.REAL || bridge.config().enabled) {
       let text = '', failure = null;
       await runTurn({ message: 'Draft a recurring prompt task from the description below. Return only JSON with title (short), prompt (self-contained; text reasoning only, no file, web, email or external tools), frequency (hourly/daily/weekdays/weekly), at (HH:MM), weekday (0 Sunday to 6 Saturday). Do not claim to execute it. Description: ' + description, signal: AbortSignal.timeout(120000), client: 'Task drafting', onFrame: frame => { if (frame.type === 'delta') text += frame.text ?? ''; if (frame.type === 'error') failure = frame.message; } });
       if (failure) return error(res, 400, failure);
       try { draft = { ...draft, ...JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '').trim()), timeZone: body.timeZone ?? 'UTC', enabled: true }; }
       catch { return error(res, 400, 'The model did not return a usable draft. Try again or set up manually.'); }
     }
-    try { return json(res, 200, { draft: validateTask(draft), demo: !models.REAL }); }
+    try { return json(res, 200, { draft: validateTask(draft), demo: !models.REAL && !bridge.config().enabled }); }
     catch (e) { return error(res, 400, e.message); }
   }
   if (path === '/api/tasks' && method === 'POST') {
@@ -1642,7 +1789,7 @@ async function api(req, res, path, method, url) {
   // --- serving ------------------------------------------------------------
   if (path === '/api/serving/tunnel' && method === 'GET') return json(res, 200, await cloudflare.inspect());
   if (path === '/api/serving/tunnel' && method === 'POST') {
-    try { const body = await readBody(req); if (body.action === 'stop') await cloudflare.stop(); else if (body.action === 'start') await cloudflare.start(body); else if (body.action === 'prepare') await cloudflare.prepare(); else throw new Error('Unknown tunnel action.'); return json(res, 200, serving.state()); }
+    try { const body = await readBody(req); if (body.action === 'start' && bridge.config().enabled) return error(res, 409, 'Turn off bridge mode before starting a public tunnel.'); if (body.action === 'stop') await cloudflare.stop(); else if (body.action === 'start') await cloudflare.start(body); else if (body.action === 'prepare') await cloudflare.prepare(); else throw new Error('Unknown tunnel action.'); return json(res, 200, serving.state()); }
     catch(e) { return error(res, 400, e.message); }
   }
   if (path === '/api/monitor/snapshot' && method === 'POST') {
@@ -1650,7 +1797,7 @@ async function api(req, res, path, method, url) {
     catch(e) { return error(res, 400, e.message); }
   }
   if (path === '/api/serving/share' && method === 'POST') {
-    try { const body = await readBody(req); if (body.enabled === true) await localShare.start(); else await localShare.stop(); return json(res, 200, serving.state()); }
+    try { const body = await readBody(req); if (body.enabled === true && bridge.config().enabled) return error(res, 409, 'Turn off bridge mode before sharing the API on your network.'); if (body.enabled === true) await localShare.start(); else await localShare.stop(); return json(res, 200, serving.state()); }
     catch(e) { return error(res, 400, e.message); }
   }
   if (path === '/api/serving' && method === 'GET') return json(res, 200, serving.state());
@@ -2074,7 +2221,10 @@ async function api(req, res, path, method, url) {
     const body = await readBody(req,12*1024*1024);
     if (path === '/api/plan/start-goal') { body.message = '/plan start'; if (typeof body.planId !== 'string') return error(res, 400, 'planId is required'); }
     let images;try{const named=Array.isArray(body.imageIds)&&body.imageIds.length?uploads.dataUrls(typeof body.sessionId==='string'?body.sessionId:'',body.imageIds):[];images=validateChatImages([...(Array.isArray(body.images)?body.images:[]),...named]);}catch(e){return error(res,400,e.message);}
-    if(images.length&&body.remoteModel){const own=modelProviders.withSecrets().find(c=>c.id===body.remoteModel.connectionId);const row=own?.models.find(m=>m.id===body.remoteModel.modelId);const refused=await pictureRefusal(own,row);if(refused)return error(res,409,refused);}
+    if (images.length && bridge.config().enabled) {
+      if (bridge.config().model.vision !== true) return error(res, 409, 'The bridge model does not report picture support.');
+    }
+    else if(images.length&&body.remoteModel){const own=modelProviders.withSecrets().find(c=>c.id===body.remoteModel.connectionId);const row=own?.models.find(m=>m.id===body.remoteModel.modelId);const refused=await pictureRefusal(own,row);if(refused)return error(res,409,refused);}
     else if(images.length){let selected;try{selected=native.resolveInstance(body.nativeModelId??native.state().defaultId);}catch(e){return error(res,409,e.message);}if(!selected.vision)return error(res,409,'This model was started without picture reading. Open Models, turn on Read pictures and load it again, or choose a model that reads pictures.');}
     // The goal bar's Resume has no words of its own: it is the same turn as "/goal resume".
     const message = body.goalAction === 'resume' ? '/goal resume' : String(body.message ?? '').trim();
@@ -2098,7 +2248,7 @@ async function api(req, res, path, method, url) {
     const agentSkip = process.env.STRATA_AGENT === 'off' ? 'The agent is turned off (STRATA_AGENT=off).'
       : body.agent === false || body.tools === false ? 'This chat runs without the agent.'
       : !chatId ? 'This request did not name a chat.'
-      : !(body.remoteModel || native.hasLive()) ? 'The agent needs a loaded Strata model or an API model.'
+      : !(bridge.config().enabled || body.remoteModel || native.hasLive()) ? 'The agent needs a loaded Strata model or an API model.'
       : null;
     if (chatId && !agentSkip) {
       const capability = agent.status();
@@ -2141,6 +2291,25 @@ async function api(req, res, path, method, url) {
 
 async function openai(req, res, path, method) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
+  if (bridgeChanging) return error(res, 503, 'Wait for Strata to finish switching the bridge mode.');
+  if (bridge.config().enabled) {
+    if (req.socket.localPort !== PORT) return error(res, 403, 'Bridge mode is available on this computer only.');
+    const route = path.replace(/\/+$/, '');
+    if (route === '/v1/models' && method === 'GET') {
+      const { model } = bridge.config();
+      return json(res, 200, { object: 'list', data: [{ id: model.id, object: 'model', owned_by: 'strata', meta: { n_ctx: model.contextMax },
+        ...(model.vision !== null ? { architecture: { input_modalities: model.vision ? ['text', 'image'] : ['text'], output_modalities: ['text'] } } : {}) }] });
+    }
+    if (method !== 'POST' || !bridgePosts.has(route)) return error(res, 404, 'Unknown bridge endpoint.');
+    if (store.get().serving?.pauseServing && route !== '/v1/messages/count_tokens') return error(res, 503, 'New API requests are paused. Resume them in Serving.');
+    return bridgeForward(req, res, route, clientName(req));
+  }
+  modelRequests++;
+  try { return await localOpenai(req, res, path, method); }
+  finally { modelRequests--; }
+}
+
+async function localOpenai(req, res, path, method) {
   if(native.state().instances.length){
     if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:native.state().instances.filter(i=>i.status==='ready').map(i=>({id:i.apiModelId,object:'model',owned_by:'strata',meta:{instanceId:i.id,gpus:i.gpus,label:i.label,aliases:i.aliases}}))});
     if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving});}
@@ -2355,6 +2524,12 @@ server.on('error', error => {
 });
 server.listen(PORT, HOST, () => {
   if (process.send) process.send({ type: 'strata-ready', port: PORT });
+  const config = bridge.config();
+  if (config.enabled) {
+    void bridge.check({ baseUrl: config.baseUrl }, bridgePorts).then(({ models }) => {
+      bridge.connection(models.some(model => model.id === config.model.id) ? null : 'The bridge model is unavailable.', config);
+    }, err => bridge.connection(err.message, config));
+  }
   // Engines a lost owner left behind (an earlier crash, an older version): ended after a PID + start time + command-line check.
   if (control && process.env.STRATA_PACKAGED === '1') control.cleanup().catch(() => {});
 });

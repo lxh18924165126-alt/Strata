@@ -9,6 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -91,6 +92,27 @@ test('status names the component and the routes, and carries no secret', { skip 
   assert.equal(status.harness.version, '0.2.1-alpha.3');
   assert.ok(status.routes.some(r => r.kind === 'api' && r.modelId === 'cloud-model'));
   assert.ok(!JSON.stringify(status).includes('sk-host-test'));
+});
+
+test('bridge mode sends every Harness model round through the Host with the remote model and key', { skip }, async t => {
+  const s = await setup(t);
+  const bridgeKey = 'sk-bridge-harness-test';
+  const enabled = await fetch(`${s.host.base}/api/bridge`, { method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true, baseUrl: s.worker.url, apiKey: bridgeKey, modelId: 'cloud-model' }) });
+  assert.equal(enabled.status, 200, await enabled.text());
+  const frames = await s.host.chat({ sessionId: 'chat-h-bridged', message: 'SCRIPT:tool bridge.txt hello', history: [] }, async f => {
+    if (f.type === 'agent-tool' && f.tool.state === 'proposed') {
+      await s.host.post('/api/chat/approval', { sessionId: 'chat-h-bridged', toolId: f.tool.id, decision: 'deny' });
+    }
+  });
+  assert.equal(frames.at(-1).type, 'done');
+  assert.ok(s.worker.requests.length >= 2);
+  const authSha = createHash('sha256').update(`Bearer ${bridgeKey}`).digest('hex');
+  assert.ok(s.worker.requests.every(r => r.model === 'cloud-model' && r.authSha === authSha));
+  const serving = await (await fetch(`${s.host.base}/api/serving`)).json();
+  assert.equal(serving.bridgeTotals.requests, s.worker.requests.length);
+  assert.ok(serving.requests.every(r => r.source === 'bridge' && r.model === 'cloud-model'));
+  assert.ok(!JSON.stringify(serving).includes(bridgeKey));
 });
 
 test('A03 over HTTP: the card waits for Approve, the answer reaches the Harness, the tool runs once', { skip }, async t => {

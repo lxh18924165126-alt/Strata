@@ -12,7 +12,8 @@ export function UsageDashboard({ loaded }: {
     loaded: boolean;
 }) {
     const native = useNative(), remoteModel = useStore(s => s.remoteModel);
-    const canChat = loaded || !!remoteModel || !!native?.instances.some(i => i.id === native.defaultId && i.status === 'ready');
+    const bridge = useStore(s => s.bridge);
+    const canChat = !!bridge?.enabled || loaded || !!remoteModel || !!native?.instances.some(i => i.id === native.defaultId && i.status === 'ready');
     const sessions = useStore(s => s.sessions), library = useStore(s => s.library);
     const [tab, setTab] = useState<'overview' | 'models'>('overview'), [period, setPeriod] = useState<UsagePeriod>('all'), [expanded, setExpanded] = useState(false);
     const now = new Date();

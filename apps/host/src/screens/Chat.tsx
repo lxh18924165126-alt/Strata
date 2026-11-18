@@ -64,7 +64,8 @@ export function ChatScreen() {
     const whileBusy = useStore(s => s.whileBusy);
     const setup = useStore(s => s.setup);
     const setupFlag = useStore(s => s.setupOpen);
-    const setupVisible = location.route === 'setup' || setupFlag || !!setup && !setup.complete && !setup.dismissed;
+    const bridge = useStore(s => s.bridge);
+    const setupVisible = !bridge?.enabled && (location.route === 'setup' || setupFlag || !!setup && !setup.complete && !setup.dismissed);
     const session: Session | null = useMemo(() => {
         const wanted = location.param ?? activeId;
         return sessions.find((s) => s.id === wanted) ?? sessions[0] ?? null;
@@ -437,7 +438,7 @@ export function ChatScreen() {
         return () => window.removeEventListener('keydown', onKey);
     }, [focusMode]);
     const chatNative = useNative(), queuedPhotos = useChatPhotos(session?.id);
-    const readyForChat = !!loaded || !!chatNative?.instances.some(i => i.status === 'ready');
+    const readyForChat = !!bridge?.enabled || !!loaded || !!chatNative?.instances.some(i => i.status === 'ready');
     useEffect(() => {
         if (setupVisible || !readyForChat || messageCount)
             return;
@@ -473,7 +474,7 @@ export function ChatScreen() {
         }
         if (timeSkip === null) {
             // No model to answer: say so plainly (or show the download), and do not start a run.
-            const why = noModelNotice(chatNative ?? null, { libraryLoaded: !!loaded });
+            const why = noModelNotice(chatNative ?? null, { remote: !!bridge?.enabled, libraryLoaded: !!loaded });
             if (why) { pushToast('info', tr(why.title), tr(why.message)); return; }
         }
         updateDraft('');
@@ -614,7 +615,8 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
 }) {
     const clearDraft = useCallback(() => setDraft(''), [setDraft]);
     const photos = useChatPhotos(session?.id), native = useNative();
-    const canChat = loaded || native?.instances.some(i => i.status === 'ready');
+    const bridge = useStore(s => s.bridge);
+    const canChat = bridge?.enabled || loaded || native?.instances.some(i => i.status === 'ready');
     const whileBusy = useStore(s => s.whileBusy), parkedList = useStore(s => (session ? s.parked[session.id] : undefined)) ?? NO_PARKED;
     const quoteList = useStore(s => (session ? s.quotes[session.id] : undefined)) ?? NO_QUOTES;
     const commands = useSlashCommands(clearDraft, setDraft);

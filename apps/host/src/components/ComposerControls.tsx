@@ -72,7 +72,8 @@ export function ComposerControls({ session, onPreview, onAttach, onError, onSlas
     const addFilesLatest = useRef<(files: File[]) => Promise<void>>(async () => { });
     // A model on an API takes a reasoning effort when its provider says it can think (OpenRouter's model list); otherwise the provider decides.
     const apiOnlyDefault = !!apiModel && apiModel.thinks !== true;
-    const pictures = pictureStatus(native, remoteModel, providers);
+    const bridge = useStore(s => s.bridge);
+    const pictures = pictureStatus(native, remoteModel, providers, bridge);
     const mode = modes.find(m => m.value === session?.preferences?.mode) ?? modes[0];
     const effort = efforts.includes(session?.preferences?.thinking ?? '') ? session!.preferences!.thinking! : 'Medium';
     const budget = session?.preferences?.thinkingBudget ?? 0;

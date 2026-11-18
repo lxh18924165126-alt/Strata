@@ -7,6 +7,7 @@ import { nowIso, round, sameSecret, uid } from './util.mjs';
 const requests = [];
 const MAX_REQUESTS = 60;
 const cancellations = new Map();
+const bridgeTotals = { requests: 0, completed: 0, failed: 0, tokensIn: 0, tokensOut: 0, cachedTokens: 0, incomplete: 0 };
 let revision = Date.now();
 
 let hubRef = null;
@@ -59,6 +60,7 @@ export function state() {
       tokensOut: requests.reduce((sum, r) => sum + (r.tokensOut || 0), 0),
     },
     requests: [...requests].reverse(),
+    bridgeTotals: { ...bridgeTotals },
     pauseServing: !!s.serving?.pauseServing,
   };
 }
@@ -94,7 +96,7 @@ export function authorized(req) {
   return viaBearer || viaHeader;
 }
 
-export function open({ client, endpoint, tokensIn = null, model, instanceId, gpuIds, cancel }) {
+export function open({ client, endpoint, tokensIn = null, model, instanceId, gpuIds, cancel, source }) {
   const entry = {
     id: uid('req'),
     at: nowIso(),
@@ -109,7 +111,9 @@ export function open({ client, endpoint, tokensIn = null, model, instanceId, gpu
     cancellable: typeof cancel === 'function',
     cancelRequested: false,
     usageSource: 'unavailable',
+    ...(source ? { source } : {}),
   };
+  if (source === 'bridge') bridgeTotals.requests++;
   if (entry.cancellable) cancellations.set(entry.id, cancel);
   requests.push(entry);
   if (requests.length > MAX_REQUESTS) {
@@ -131,10 +135,18 @@ export function mark(id, patchObj) {
 export function finish(id, { tokensOut, durationMs, error }) {
   const entry = requests.find((r) => r.id === id);
   if (!entry) return;
+  const active = entry.state === 'queued' || entry.state === 'generating';
   entry.state = error ? 'error' : 'done';
   entry.tokensOut = tokensOut ?? entry.tokensOut;
   entry.durationMs = durationMs ?? entry.durationMs;
   if (error) entry.error = error;
+  if (active && entry.source === 'bridge') {
+    bridgeTotals[error ? 'failed' : 'completed']++;
+    bridgeTotals.tokensIn += entry.tokensIn ?? 0;
+    bridgeTotals.tokensOut += entry.tokensOut ?? 0;
+    bridgeTotals.cachedTokens += entry.cachedTokens ?? 0;
+    if (entry.usageIncomplete) bridgeTotals.incomplete++;
+  }
   entry.cancellable = false;
   cancellations.delete(id);
   emit();

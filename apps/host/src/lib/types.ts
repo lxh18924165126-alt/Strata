@@ -201,7 +201,12 @@ export interface RuntimeModels {
   memory:{ramGb:number;budgetGb:number;reserveGb:number;totalGb:number;fits:boolean;devices:{id:string;name:string;usedGb:number;budgetGb:number}[]};
 }
 
+export interface BridgeModel { id: string; name: string; contextMax: number | null; vision: boolean | null }
+export interface BridgeState { enabled: boolean; baseUrl: string; apiKeySet: boolean; model: BridgeModel | null; status: 'idle' | 'connected' | 'error'; error: string | null }
+
 export interface ServeRequest {
+  source?: 'bridge';
+  usageIncomplete?: boolean;
   instanceId?:string;
   gpuIds?:string[];
   id: string;
@@ -229,6 +234,7 @@ export interface ServeRequest {
 export interface TunnelState { status: 'idle' | 'starting' | 'connected' | 'stopping' | 'error'; mode: 'quick' | 'domain' | null; url: string | null; error: string | null; warning?: string | null; installed: boolean; originUrl: string; connector?: { path: string; version: string | null; source: string; label: string; summary: string } | null; external?: { kind: 'service' | 'process'; others: number[]; own: number[]; message: string } | null; }
 
 export interface ServingState {
+  bridgeTotals?: { requests: number; completed: number; failed: number; tokensIn: number; tokensOut: number; cachedTokens: number; incomplete: number };
   tunnel?: TunnelState;
   sharing?: { active: boolean; url: string | null; warning?: string | null };
   revision?: number;
