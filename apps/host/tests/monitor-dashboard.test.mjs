@@ -84,9 +84,11 @@ test('both supported engine metric formats keep their actual telemetry',()=>{
   assert.throws(()=>parseEngineMetrics('<html>error</html>'));
 });
 test('original requests, cache, progress, hardware and MCP facts are translated without losing information',()=>{
-  const raw={engine:{max_context:32768,expert_slots:48,expert_cache_mib:8192},live:{state:'generating',generated:120,max_tokens:600,prompt_tokens:200,tok_s:44},hardware:{gpu_mem_used:4*1024**3,gpu_mem_total:24*1024**3},history:{tok_s:[42,44]},requests:[{time:1,finish:'stop',prompt_tokens:200,reused:100,output_tokens:120,decode_tok_s:44,hit_rate:.85,pcie_share:.1,duration_s:3}],totals:{requests:20,prompt_tokens:4000,output_tokens:2400,reused:2000,since:1},conversation_cache:{enabled:true,budget_mib:8192,parked:2,slots:4,bytes:2*1024**3,parks:3,restores:1,requests:20,requests_reused:10},mcp:{tools:1,servers:[{name:'files',status:'ready',transport:'stdio',tools:[{tool:'read_file',description:'Read a file'}]}]}};
+  const raw={engine:{max_context:32768,expert_slots:48,expert_cache_mib:8192},live:{state:'generating',generated:120,max_tokens:600,prompt_tokens:200,tok_s:44},hardware:{gpu_mem_used:4*1024**3,gpu_mem_total:24*1024**3},history:{tok_s:[42,44]},requests:[{time:1,finish:'stop',prompt_tokens:200,reused:100,output_tokens:120,decode_tok_s:44,decode_peak_tok_s:61,hit_rate:.85,pcie_share:.1,duration_s:3}],totals:{requests:20,prompt_tokens:4000,output_tokens:2400,reused:2000,since:1},conversation_cache:{enabled:true,budget_mib:8192,parked:2,slots:4,bytes:2*1024**3,parks:3,restores:1,requests:20,requests_reused:10},mcp:{tools:1,servers:[{name:'files',status:'ready',transport:'stdio',tools:[{tool:'read_file',description:'Read a file'}]}]}};
   const mapped=originalDashboard(raw,{gpus:[gpu('a')]},{context:{maxTokens:32768},hardware:{},history:[],totals:{},telemetry:{}});
-  assert.equal(mapped.requests[0].cachedTokens,100);assert.equal(mapped.requests[0].hitRate,.85);
+  assert.equal(mapped.requests[0].cachedTokens,100);assert.equal(mapped.requests[0].hitRate,.85);assert.equal(mapped.requests[0].peakTps,61);
+  const withoutPeak=originalDashboard({...raw,requests:[{...raw.requests[0],decode_peak_tok_s:undefined}]},{gpus:[gpu('a')]},{context:{maxTokens:32768},hardware:{},history:[],totals:{},telemetry:{}});
+  assert.equal(withoutPeak.requests[0].peakTps,null);
   assert.equal(mapped.conversationCache.memoryGb,2);assert.equal(mapped.totals.cachedTokens,2000);
   assert.equal(mapped.expertCache.memoryGb,8);assert.equal(mapped.hardware.vramUsedGb,4);
   assert.equal(mapped.generation.total,600);assert.equal(mapped.history[0].gpuTempC,null);
