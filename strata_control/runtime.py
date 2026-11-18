@@ -836,6 +836,9 @@ def restart(name: str, *, timeout: float = 1000, startup_wait: float = 300,
         raise ProfileError("source change needs the candidate SHA-256 from runtime restart --plan")
     params = {"startup_wait": startup_wait, "allow_source_switch": allow_source_switch,
               "allow_source_migration": allow_source_migration}
+    from strata_control import gpu_allowlist
+    if gpu_allowlist.VAR in os.environ:
+        params["gpu_allowlist"] = os.environ[gpu_allowlist.VAR]
     if expected_source_sha256 is not None:
         params["expected_source_sha256"] = expected_source_sha256
     if expected_profile_revision is not None:
@@ -1353,6 +1356,11 @@ class Host:
                 result = self._stop_child()
             return {**result, "profile": self.name}
         if command == "restart":
+            from strata_control import gpu_allowlist
+            requested_devices = request.get("gpu_allowlist")
+            if requested_devices is not None and requested_devices != os.environ.get(gpu_allowlist.VAR):
+                return {"ok": False, "exit_code": 6,
+                        "error": f"{gpu_allowlist.VAR} changed; stop the runtime owner and start it with the new environment"}
             startup_wait = request.get("startup_wait", 300)
             if type(startup_wait) not in (int, float) or not 1 <= startup_wait <= MAX_START_WAIT:
                 return {"ok": False, "error": "invalid_startup_wait", "exit_code": 2}

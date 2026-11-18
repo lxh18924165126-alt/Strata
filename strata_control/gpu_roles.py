@@ -470,6 +470,10 @@ def env_visible(indexes: list[int], vendor: str | None, environ: dict | None = N
         return seen
     if vendor != "nvidia":
         return None
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load(env)
+    if policy is not None:
+        return [i for i in policy.indexes(env.get(gpu_allowlist.MASK, policy.allowed)) if i in indexes]
     raw = env.get("CUDA_VISIBLE_DEVICES")
     if raw is not None and raw.strip() and len(cards) > 1 and not alike and str(env.get("CUDA_DEVICE_ORDER") or "").strip().upper() != "PCI_BUS_ID":
         return None                                          # numbers in CUDA's own card order (fastest first) cannot be told from nvidia-smi's here
@@ -478,6 +482,11 @@ def env_visible(indexes: list[int], vendor: str | None, environ: dict | None = N
 
 def visible_cards(cards: list[dict], vendor: str | None, environ: dict | None = None, keep: set[int] | frozenset[int] = frozenset()) -> list[dict]:
     """`cards` without the ones the environment hides (env_visible); a card in `keep` (named with --gpu, which the server sets the visibility from) stays."""
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load(environ) if vendor == "nvidia" else None
+    if policy is not None:
+        allowed = set(policy.indexes(policy.allowed))
+        keep = keep & allowed
     vis = env_visible([_idx(c) for c in cards], vendor, environ, alike=len({(str(c.get("name")), rnd_(_mem(c))) for c in cards}) <= 1)
     if vis is None:
         return list(cards)
@@ -491,6 +500,8 @@ def nvidia_speeds(timeout: float = 20.0) -> dict[int, float]:
     import os
     import subprocess
     import sys
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load()
     code = ("import ctypes,sys,os\n"
             "os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'\n"
             "lib=ctypes.CDLL('nvcuda.dll' if os.name=='nt' else 'libcuda.so.1')\n"
@@ -507,13 +518,17 @@ def nvidia_speeds(timeout: float = 20.0) -> dict[int, float]:
     try:
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env.pop("CUDA_VISIBLE_DEVICES", None)
+        if policy is None:
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            env = policy.restrict_env(env)
+            indices = policy.indexes(env[gpu_allowlist.MASK])
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
         out = {}
         for line in r.stdout.splitlines():
             i, sm, khz = (int(x) for x in line.split())
             if sm > 0 and khz > 0:
-                out[i] = float(sm) * float(khz)
+                out[indices[i] if policy is not None else i] = float(sm) * float(khz)
         return out
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}

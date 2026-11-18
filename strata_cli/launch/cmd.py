@@ -847,6 +847,8 @@ def run_launch(a: argparse.Namespace) -> int:
                     return fail(f"No model set up by setup.py matches '{a.model}' and has an API key, and no launch is running.", 5)
             return fail("There is no API key for that launch." + ("" if a.preset else " Name a preset with --preset NAME, or a model set up by setup.py with --model NAME."), 5)
 
+        from strata_control import gpu_allowlist
+        gpu_policy = gpu_allowlist.load()
         backend_note = None
         if getattr(a, "backend", None):
             from strata_control import engine_component as _ec
@@ -860,6 +862,8 @@ def run_launch(a: argparse.Namespace) -> int:
                 family = _ec.clean_backend_name(word)
                 if not family:
                     return fail(f"'{a.backend}' is not a make of graphics card Strata knows. Use nvidia, amd, intel or auto.", 2)
+                if gpu_policy is not None:
+                    gpu_policy.require_backend(family)
                 os.environ[_ec.ENV_BACKEND] = family          # this launch and everything it starts
                 made = _ec.MAKE_NAMES[family]
                 if a.plan:
@@ -875,6 +879,8 @@ def run_launch(a: argparse.Namespace) -> int:
             if a.model or a.model_path:
                 return fail(str(e), 5)
         s, notices = settings_from_args(a, catalog)
+        if gpu_policy is not None:
+            gpu_policy.resolve(s.gpus or [index for index, role in (s.gpu_roles or {}).items() if role != "off"])
         if backend_note:
             notices.append(S.Notice("warn", backend_note, ""))
         if not machine:

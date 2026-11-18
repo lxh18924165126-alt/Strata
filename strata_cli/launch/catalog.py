@@ -326,10 +326,16 @@ class Catalog:
                   "note": "experimental: the CUDA 12 engine (docs/OLDER_GPUS.md)"} if g in old else g) for g in gpus]
 
     def computer(self, fresh: bool = False) -> Computer:
+        from strata_control import gpu_allowlist
         hw = self.hardware(fresh)
-        return Computer(ram_gb=hw.get("ram_gb"), gpus=list(hw.get("gpus") or []), disk_free_gb=hw.get("disk_free_gb"),
+        gpus = list(hw.get("gpus") or [])
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            allowed = set(policy.indexes(policy.allowed))
+            gpus = [gpu for gpu in gpus if gpu.get("vendor") == "nvidia" and gpu.get("index") in allowed]
+        return Computer(ram_gb=hw.get("ram_gb"), gpus=gpus, disk_free_gb=hw.get("disk_free_gb"),
                         os=str(hw.get("os") or ""), avx2=(hw.get("cpu") or {}).get("avx2"), raw=hw,
-                        engine_vendor=self.engine_vendor(hw))
+                        engine_vendor="nvidia" if policy is not None else self.engine_vendor(hw))
 
     def installed_backend(self) -> str | None:
         """The installed engine's backend (cuda, hip, sycl, cpu, metal), None when there is no usable engine yet."""

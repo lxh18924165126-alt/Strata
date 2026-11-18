@@ -52,6 +52,91 @@ docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 \
   ghcr.io/niko1221/strata:0.2.7-cuda13
 ```
 
+### Run on specific NVIDIA GPUs
+
+On a shared host, restrict access with NVIDIA Container Toolkit and use the same full GPU UUIDs in `STRATA_GPU_ALLOWLIST`.
+Strata checks this list for inference, the picture reader, and image generation, including when workers restart. A CUDA
+selection outside the list stops with an error. Within Strata, numeric settings such as `--gpu`, `vision.cuda_device`, and
+`images.gpu` refer to the indices that `nvidia-smi` shows where Strata is running. The indices inside a container can differ
+from those on the host. CUDA receives the UUIDs in the actual worker's device order.
+When the image generation worker is configured by hand, set `images.backend` to match its CUDA or CPU build.
+
+The following Bash example uses host GPUs 2 and 3. Run it from the fork checkout containing the allowlist change, with
+NVIDIA Container Toolkit already configured. The Docker device request restricts which GPUs the process can access.
+`STRATA_GPU_ALLOWLIST` checks the choices made by Strata and its CUDA workers. Launch the Terminal or desktop app from
+the environment containing this variable for native use. Stop existing desktop and runtime owners before changing the list.
+
+```bash
+set -euo pipefail
+nvidia-smi --query-gpu=index,uuid --format=csv,noheader
+gpu2=$(nvidia-smi -i 2 --query-gpu=uuid --format=csv,noheader)
+gpu3=$(nvidia-smi -i 3 --query-gpu=uuid --format=csv,noheader)
+export STRATA_GPU_ALLOWLIST="$gpu2,$gpu3"
+gpu_request="\"device=$STRATA_GPU_ALLOWLIST\""
+
+docker build -t strata:gpu23 --build-arg STRATA_COMMIT="$(git rev-parse HEAD)" \
+  --build-arg CUDA_ARCHITECTURES=89 .
+gpu_rows=$(docker run --rm --gpus "$gpu_request" \
+  -e NVIDIA_VISIBLE_DEVICES="$STRATA_GPU_ALLOWLIST" \
+  --entrypoint nvidia-smi strata:gpu23 --query-gpu=index,uuid --format=csv,noheader)
+printf '%s\n' "$gpu_rows"
+diff -u <(printf '%s\n' "$gpu2" "$gpu3" | sort) \
+        <(printf '%s\n' "$gpu_rows" | awk -F ', *' '{print $2}' | sort)
+container_gpus=$(printf '%s\n' "$gpu_rows" | cut -d, -f1 | paste -sd, -)
+
+mkdir -p /mnt/nvme1/strata-gpu23
+STRATA_API_KEY=$(openssl rand -hex 24)
+export STRATA_API_KEY
+docker run -d --name strata-gpu23 --gpus "$gpu_request" \
+  -e NVIDIA_VISIBLE_DEVICES="$STRATA_GPU_ALLOWLIST" -e STRATA_GPU_ALLOWLIST \
+  -p 127.0.0.1:8080:8080 --ulimit memlock=-1:-1 --shm-size 2g --stop-timeout 120 \
+  -v /mnt/nvme1/strata-gpu23:/data -e "API_KEY=$STRATA_API_KEY" \
+  -e "GPUS=$container_gpus" -e FAMILY=qwen -e MODEL=q2_0 -e VISION=gpu strata:gpu23
+docker logs -f strata-gpu23
+```
+
+Once the service is ready, check that it answers. From another host terminal, use `docker top` to get host PIDs and run
+the GPU process query while each request is in progress. Every Strata compute PID should appear only on the two UUIDs
+printed above. When testing a GPU picture reader or image generator, confirm its process appears in the compute query
+while the request runs. A CPU fallback does not exercise the GPU path.
+
+```bash
+model=$(curl -fsS -H "Authorization: Bearer $STRATA_API_KEY" \
+  http://127.0.0.1:8080/v1/models | jq -er '.data[0].id')
+curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $STRATA_API_KEY" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg model "$model" '{model:$model,messages:[{role:"user",content:"Explain why the sky is blue."}],max_tokens:128}')"
+# Run this in another host terminal while sending requests.
+watch -n 0.5 'docker top strata-gpu23 -eo pid,args; nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name --format=csv'
+```
+
+For picture reading, set `test_image` to a local PNG. Image generation needs the separate model and CUDA worker from the
+[image generation setup](IMAGES.md). Run its request against the allowlisted service with that worker configured.
+
+```bash
+test_image=/path/to/test.png
+jq -nc --arg model "$model" --rawfile picture <(base64 -w0 "$test_image") \
+  '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Describe this picture."},{type:"image_url",image_url:{url:("data:image/png;base64,"+$picture)}}]}],max_tokens:128}' \
+  | curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+      -H "Authorization: Bearer $STRATA_API_KEY" -H 'Content-Type: application/json' --data-binary @-
+
+curl -fsS http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer $STRATA_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"A blue cup on a wooden table","size":"512x512","seed":42}' \
+  -o /tmp/strata-gpu23-image.json
+
+docker restart strata-gpu23
+docker exec strata-gpu23 nvidia-smi --query-gpu=index,uuid --format=csv,noheader
+```
+
+Repeat the requests and PID checks after the restart. To check refusal without starting a model, run the following
+plan. It must exit nonzero with a `STRATA_GPU_ALLOWLIST` error. For a native fork install on the host, the same test can
+use `--gpu 0` to check that the real host GPU 0 is refused.
+
+```bash
+docker exec strata-gpu23 strata launch --plan --family qwen --model q2_0 --gpu 99
+```
+
 **AMD**
 
 ```sh

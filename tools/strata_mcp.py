@@ -995,6 +995,12 @@ class Strata:
             hw["cpu"] = {"name": platform.processor(), "cores": physical_cores(), "threads": os.cpu_count()}
         if sys.platform == "darwin":                    # a Mac: one pool of unified memory, the Metal engine (strata_control/mac_fit.py)
             return self._mac_hardware(hw)
+        gpu_policy = None
+        if "STRATA_GPU_ALLOWLIST" in os.environ:
+            if str(self.src) not in sys.path:
+                sys.path.insert(0, str(self.src))
+            from strata_control import gpu_allowlist
+            gpu_policy = gpu_allowlist.load()
         nv = []
         try:
             nv = S.gpus() if S else own_nvidia_gpus()
@@ -1063,6 +1069,9 @@ class Strata:
             except Exception:                           # noqa: BLE001 - an older Control folder without it: the report is what it was
                 arc = []
         hw["gpus"] = nv + amd + arc
+        if gpu_policy is not None:
+            allowed = set(gpu_policy.indexes(gpu_policy.allowed))
+            hw["gpus"] = [gpu for gpu in nv if gpu.get("index") in allowed]
         for g in hw["gpus"]:                            # each make numbers its cards from 0 (the engine drives one make): a stable id tells two cards apart
             g.setdefault("id", f"{g.get('vendor') or 'gpu'}:{g.get('index')}")
         try:                                            # how fast each card is (SMs x clock): the app and the Terminal pick the Main card by it
@@ -1071,7 +1080,10 @@ class Strata:
         except Exception:                               # noqa: BLE001 - unknown speed: the card with the most memory is Main
             pass
         self._engine_code(hw)
-        self._engine_vendor(hw)
+        if gpu_policy is None:
+            self._engine_vendor(hw)
+        else:
+            hw["engine_vendor"] = "nvidia"
         if WIN:
             hw["display_adapters"] = windows_video_controllers()
         hw["nvidia_smi"] = bool(shutil.which("nvidia-smi"))

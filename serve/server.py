@@ -80,6 +80,7 @@ from strata_control import drafting  # noqa: E402
 from strata_control import vram_fit  # noqa: E402
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
+from strata_control import gpu_allowlist  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
@@ -1034,6 +1035,10 @@ def visible_device_order(env: dict | None, backend: str | None) -> list[int]:
         return []
     name = "HIP_VISIBLE_DEVICES" if backend == "hip" else "CUDA_VISIBLE_DEVICES"
     value = (env or {}).get(name)
+    if backend != "hip" and isinstance(value, str) and value.startswith("GPU-"):
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            return policy.indexes(value)
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}(?:,[0-9]{1,5}){0,15}", value):
         return []
     devices = [int(part) for part in value.split(",")]
@@ -1150,6 +1155,14 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
                  retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None):
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            env = policy.restrict_env(dict(os.environ) if env is None else env)
+            args = gpu_allowlist.prepare_engine_args(args, env, policy)
+            if retry_args is not None:
+                retry_args = gpu_allowlist.prepare_engine_args(retry_args, env, policy)
+            if retry_vram_args is not None:
+                retry_vram_args = gpu_allowlist.prepare_engine_args(retry_vram_args, env, policy)
         # retry_args: the arguments to start again with, once, when this start ends before the engine is ready (an Auto start that picked DFlash2: mtp_retry_args)
         # retry_vram_args: the same start with no drafter (nodraft_retry_args), used instead when the engine ended because a card ran out of memory: swapping DFlash2 for
         # the MTP takes MORE memory from a card that is already short, so that direction is never taken then
@@ -1176,9 +1189,12 @@ class StrataEngine:
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
-            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+            build = json.loads((Path(exe).parent / "BUILD.json").read_text())
         except (OSError, ValueError):
-            self.info["version"] = None
+            build = {}
+        self.info["version"] = build.get("version")
+        if policy is not None:
+            policy.require_backend(build.get("backend"))
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
@@ -3288,6 +3304,11 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            if cfg.get("gpu") and "hip" in Path(str(cfg["exe"])).name.lower():
+                policy.require_backend("hip", name="picture reader")
+            env = policy.restrict_env(dict(os.environ) if env is None else env)
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
@@ -3387,7 +3408,12 @@ class Vision:
         """(is it the AMD reader, the cards its environment shows it: CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES or None)."""
         args, _log, env = self.spawn
         amd = "hip" in Path(str(args[0])).name.lower()
-        return amd, (env if env is not None else os.environ).get("HIP_VISIBLE_DEVICES" if amd else "CUDA_VISIBLE_DEVICES")
+        visible = (env if env is not None else os.environ).get("HIP_VISIBLE_DEVICES" if amd else "CUDA_VISIBLE_DEVICES")
+        if not amd and visible and visible.startswith("GPU-"):
+            policy = gpu_allowlist.load()
+            if policy is not None:
+                visible = ",".join(map(str, policy.indexes(visible)))
+        return amd, visible
 
     def use_cpu(self) -> bool:
         """The next start is the CPU reader's (the card has no room for the GPU one): False when there is no CPU reader to use."""
@@ -4141,6 +4167,9 @@ def hip_visible(cfg: dict) -> list[int]:
 def gpu_speed_scores(indices: list[int]) -> dict[int, float] | None:
     """Multiprocessors x max clock for each NVIDIA card, numbered as nvidia-smi numbers them (the CUDA driver API,
     which every driver ships: no toolkit needed); None when it cannot say for every one of them."""
+    if gpu_allowlist.VAR in os.environ:
+        scores = gpu_roles.nvidia_speeds()
+        return scores if all(index in scores for index in indices) else None
     code = (
         "import ctypes,sys,os\n"
         "os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'\n"
@@ -4427,7 +4456,15 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = quiet_crash_env(dict(os.environ))          # no debugger on a user's machine: ggml's abort path forks gdb (strata_control/childenv.py)
-    if gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
+    policy = gpu_allowlist.load()
+    selected = None
+    if policy is not None:
+        policy.require_backend(cfg.get("backend"))
+        cards = gpu_list(cfg)
+        if cards:
+            policy.resolve(cards)                     # reject before the speed probe or split planner runs
+        selected = [] if gpu_all_off(cfg) or cfg.get("backend") == "cpu" else ordered_gpus(cfg) if cards else None
+    elif gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
         env["CUDA_VISIBLE_DEVICES"] = ""
         env["HIP_VISIBLE_DEVICES"] = ""
     elif hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
@@ -4435,8 +4472,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
-        env[str(k)] = str(v)
+    env = gpu_allowlist.config_env(env, cfg.get("env") or {}, policy, selected)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
@@ -4546,6 +4582,10 @@ def card_note(cfg: dict, env: dict) -> str | None:
     if cfg.get("backend") == "hip" or not gpu_list(cfg):
         return None
     mine = [x.strip() for x in str((env or {}).get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip() != ""]
+    if mine and mine[0].startswith("GPU-"):
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            mine = list(map(str, policy.indexes(mine)))
     if not mine or mine == [str(i) for i in range(len(mine))]:
         return None
     names = [f"CUDA{i}" for i in range(len(mine))]
@@ -4610,6 +4650,9 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
     keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
     dev = (cfg.get("vision") or {}).get("cuda_device")
+    policy = gpu_allowlist.load()
+    if policy is not None:
+        return policy.restrict_env(env, dev)
     if dev is None and cfg.get("backend") == "hip":
         dev = vision_card_off_igpu(env, archs)
     if dev is None:
@@ -5432,9 +5475,11 @@ class Service:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
             why = None
+            policy = gpu_allowlist.load()
+            env = policy.restrict_env(dict(os.environ)) if policy is not None else None
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, env=env)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
             except subprocess.TimeoutExpired:
@@ -10061,11 +10106,19 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     normal layer-split config under "split_fallback": if that engine refuses or fails to come up, say so in one plain line and start the
     normal one instead, so a start never fails because of the option. Any other config starts exactly as before."""
     fb = cfg.get("split_fallback")
+    cfg2 = None
+    if isinstance(fb, dict) and fb.get("exe"):
+        cfg2 = {k: v for k, v in cfg.items() if k not in SPLIT_KEYS + ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting")}
+        cfg2.update(fb)
+        if gpu_allowlist.VAR in os.environ:
+            child_env(cfg2, offline=offline)
     try:
         return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
                             retry_args=mtp_retry_args(cfg, exe, effort_end), retry_vram_args=nodraft_retry_args(cfg, exe, effort_end))
+    except gpu_allowlist.AllowlistError:
+        raise
     except Exception as e:
-        if not isinstance(fb, dict) or not fb.get("exe"):
+        if cfg2 is None:
             raise
         msg = str(e).strip()
         why = msg.splitlines()[0][:200] if msg else type(e).__name__
@@ -10080,8 +10133,6 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
             except OSError:
                 pass
         print(f"[strata] The all-cards split engine could not start ({why}). Starting the normal layer split instead.", flush=True)
-    cfg2 = {k: v for k, v in cfg.items() if k not in SPLIT_KEYS + ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting")}
-    cfg2.update(fb)
     cfg2 = with_component_engine(cfg2)
     if engine_component.is_reference(cfg2["exe"]):
         exe2 = _component_exe(cfg2["exe"], cfg2)
@@ -10101,6 +10152,9 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
     from serve import replicas as rp
+    policy = gpu_allowlist.load()
+    if policy is not None:
+        policy.resolve([card for group in groups for card in group])
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
@@ -10133,7 +10187,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
             t.start()
         for t in ts:
             t.join()
-    if errors and arena and len(errors) < n:
+    policy_error = next((e for _, e in errors if isinstance(e, gpu_allowlist.AllowlistError)), None)
+    if errors and arena and len(errors) < n and policy_error is None:
         # a replica that died while it was reading the experts into the shared arena (or any other one that failed) while
         # another one is up: the living engine took the read over (the state word in the arena), so start the failed ones
         # once more on the same arena instead of giving up the sharing
@@ -10151,6 +10206,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
         rp.remove_arena(arena)
+        if policy_error is not None:
+            raise policy_error
         i, e = errors[0]
         if arena:       # a shared arena that could not be made (no room in /dev/shm, a file of another pack): as before
             print(f"[strata] replica {i} did not start with the shared expert arena ({e}); starting every replica with "
@@ -10172,6 +10229,9 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     front hands a long prompt from the first to the second."""
     from serve import split as sp
     sp.check_cfg(cfg, spec)
+    policy = gpu_allowlist.load()
+    if policy is not None:
+        policy.resolve([spec["prefill_gpu"], spec["decode_gpu"]])
     arena, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
     print(f"[strata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
@@ -10722,6 +10782,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         # missing shard or a plugin would break the promise the flag makes.
         env = child_env(cfg, offline=a.offline)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
+        if cfg.get("images") and gpu_allowlist.VAR in os.environ:
+            images_api.image_env(cfg["images"])
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -11126,4 +11188,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except gpu_allowlist.AllowlistError as e:
+        sys.exit(f"[strata] {e}")

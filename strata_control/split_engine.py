@@ -369,6 +369,11 @@ def _named_or_visible(cards: list[Card], indexes: list[int] | None) -> list[Card
     """The cards the launch named; with none named, the ones the environment leaves visible (CUDA_VISIBLE_DEVICES, AMD: ROCR_VISIBLE_DEVICES then HIP_VISIBLE_DEVICES): a
     card the engine will not see is not one the split can use. Named cards are the server's own visibility list (it sets it from them), so they are kept as named."""
     if indexes is not None:
+        if cards and cards[0].vendor == "nvidia":
+            from strata_control import gpu_allowlist
+            policy = gpu_allowlist.load()
+            if policy is not None:
+                policy.resolve(indexes)
         return [c for c in cards if c.index in indexes]
     if not cards:
         return cards

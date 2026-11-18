@@ -2078,7 +2078,13 @@ class Runner:
     def choices(self) -> dict:
         """The choices that make one server different from another (not the bookkeeping, and the key only as a fingerprint)."""
         import hashlib
+        from strata_control import gpu_allowlist
         d = {k: v for k, v in self.s.to_dict(with_key=False).items() if k not in self.CHOICE_SKIP}
+        policy = gpu_allowlist.load()
+        if policy is not None:
+            env = policy.restrict_env(dict(os.environ))
+            d["gpu_allowlist"] = env[gpu_allowlist.VAR]
+            d["cuda_visible_devices"] = env[gpu_allowlist.MASK]
         d["key"] = hashlib.sha256(("none" if self.s.no_key and not self.s.api_key else self.s.api_key or "").encode("utf-8")).hexdigest()[:16]
         return json.loads(json.dumps(d, sort_keys=True))
 

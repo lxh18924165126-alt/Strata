@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 from strata_control.childenv import quiet_crash_env
+from strata_control import gpu_allowlist
 
 # Qwen-Image-2.1-Turbo's own schedule (model_index.json "sample_sigmas") plus the terminal 0, as Unsloth's card passes
 # it to sd-cli; it is an 8-step schedule, so another step count leaves the schedule to sd.cpp
@@ -156,7 +157,17 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     gpu = cfg.get("gpu")
-    if gpu is not None:
+    policy = gpu_allowlist.load()
+    selected = None
+    if policy is not None:
+        backend = cfg.get("backend")
+        if backend is None:
+            raise gpu_allowlist.AllowlistError("set the image generation backend to cuda or cpu")
+        policy.require_backend(backend, name="image generation")
+        if gpu is not None:
+            policy.resolve(gpu)
+        selected = [] if backend == "cpu" else gpu
+    elif gpu is not None:
         var = {"cuda": "CUDA_VISIBLE_DEVICES", "hip": "HIP_VISIBLE_DEVICES",
                "vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(cfg.get("backend"))
         if var:
@@ -164,9 +175,7 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
             env[var] = ",".join(str(x).strip() for x in gpu if str(x).strip() != "") if isinstance(gpu, (list, tuple)) else str(gpu)
             if var == "CUDA_VISIBLE_DEVICES":
                 env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    for k, v in (cfg.get("env") or {}).items():
-        env[str(k)] = str(v)
-    return env
+    return gpu_allowlist.config_env(env, cfg.get("env") or {}, policy, selected)
 
 
 # ------------------------------------------------------------------------------- the model's transparency
@@ -333,6 +342,7 @@ class ImageGen:
 
     def __init__(self, cfg: dict, log=None):
         self.cfg = dict(cfg)
+        self.env = image_env(self.cfg) if gpu_allowlist.VAR in os.environ else None
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
             raise ValueError(f'images "gpu_policy" must be one of {", ".join(POLICIES)}, not {policy!r}')
@@ -403,7 +413,7 @@ class ImageGen:
                 try:
                     from serve import lifeline
                     proc = lifeline.popen(cmd, "image", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          stdin=subprocess.DEVNULL, env=image_env(self.cfg),
+                                          stdin=subprocess.DEVNULL, env=self.env if self.env is not None else image_env(self.cfg),
                                           cwd=str(work), text=True, errors="replace", bufsize=1)
                 except OSError as e:
                     raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e

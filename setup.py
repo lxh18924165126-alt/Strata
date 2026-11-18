@@ -1776,6 +1776,11 @@ def gpus():
                           "driver": drv})
         except ValueError:
             continue
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load()
+    if policy is not None:
+        allowed = set(policy.indexes(policy.allowed))
+        found = [gpu for gpu in found if gpu["index"] in allowed]
     return found
 
 
@@ -9189,6 +9194,10 @@ def dsv41_config_env(cards) -> dict:
 
 def dsv41_engine_env(lib_dirs) -> dict:
     env = dict(os.environ)
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load()
+    if policy is not None:
+        env = policy.restrict_env(env)
     dirs = [str(d) for d in lib_dirs or [] if d]
     if dirs:
         env["PATH" if WIN else "LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [env.get("PATH" if WIN else "LD_LIBRARY_PATH", "")])
@@ -9348,11 +9357,17 @@ def dsv41_smoke(exe: Path, pack: Path, lib_dirs, gpus=None, timeout: int = 5400)
     """16 tokens of a fixed prompt through the engine (tools/dsv41/smoke.py), the text checked: (True, text) or (False, why).  Takes a
     few minutes: the engine reads what it needs from the SSD the first time."""
     cmd = [sys.executable, str(ROOT / "tools" / "dsv41" / "smoke.py"), "--exe", str(exe), "--pack", str(pack)]
+    env = dsv41_engine_env(lib_dirs)
+    from strata_control import gpu_allowlist
+    policy = gpu_allowlist.load()
     if gpus:
+        if policy is not None:
+            env = policy.restrict_env(env, gpus)
+            gpus = range(len(gpus))                   # DeepSeek takes CUDA ordinals within the UUID mask
         cmd += ["--gpus", ",".join(str(g) for g in gpus)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           env=dsv41_engine_env(lib_dirs))
+                           env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"the test run did not finish: {e}"
     text = ((r.stdout or "") + (r.stderr or "")).strip()
@@ -10321,6 +10336,13 @@ def main() -> int:
         return prepare_pack_only(a)
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+    from strata_control import gpu_allowlist
+    try:
+        gpu_policy = gpu_allowlist.load()
+        if gpu_policy is not None:
+            gpu_policy.require_backend(a.backend)
+    except gpu_allowlist.AllowlistError as e:
+        ap.error(str(e))
     if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
         if a.family in MULTI_FILE_FAMILIES:            # DeepSeek-V4.1-Flash: its own engine package, the generic DeepSeek install
             return mac_dsv41_setup(a)
@@ -10363,6 +10385,13 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
+    if gpu_policy is not None:
+        picked = a.gpus if a.gpus else a.gpu
+        if picked is not None and str(picked).strip().lower() != "all":
+            try:
+                gpu_policy.resolve(picked)
+            except gpu_allowlist.AllowlistError as e:
+                ap.error(str(e))
     say("Strata - " + (MULTI_FILE_FAMILIES[a.family]["title"] if a.family in MULTI_FILE_FAMILIES else
                        OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")
@@ -10465,7 +10494,7 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
-    amd = amd_gpus()
+    amd = amd_gpus() if gpu_policy is None else []
     amd_ok = [g for g in amd if amd_problem(g) is None]
     # older NVIDIA GPUs (Pascal / Volta): the experimental CUDA 12 engine, when chosen (docs/OLDER_GPUS.md)
     OLD_GPUS = OLD_GPUS or old_gpus_opt_in(found, named_gpus(a.gpu, a.gpus), a.cuda,
