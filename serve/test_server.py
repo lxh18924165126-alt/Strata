@@ -2080,8 +2080,9 @@ class IncrementalPrompts(unittest.TestCase):
             msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
             status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
             self.assertEqual(status, 200, b)
-            prompt = self.svc.template.render(msgs)
-            self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
+            expected = [{"role": "system", "content": "Be brief.\n\nYou are yuxi-v1."}, *msgs[1:]]
+            prompt = self.svc.template.render(expected)
+            self.assertEqual(self.engine.last_ids, full.encode_prompt(expected, None, {}))
             if turn:
                 self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
             msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
@@ -2148,16 +2149,18 @@ class IncrementalPrompts(unittest.TestCase):
         before = list(svc.prompts.entries)
         full = self.service()
         full.prompts = None
+        identity = {"role": "system", "content": "You are yuxi-v1."}
         for n in range(1, 6):
             other = self.conversation(n)
             status, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": other})
             self.assertEqual(status, 200, b)
-            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {})))
+            self.assertEqual(b["input_tokens"], len(full.encode_prompt([identity, *other], None, {})))
         self.assertTrue(svc.prompts.entries == before, "the count wrote into the kept prompts")
         main.append({"role": "assistant", "content": "ok"})
         main.append({"role": "user", "content": "and then?"})
-        svc.encode_prompt(main, None, {})
-        self.assertGreater(svc.prompts.last_reused, len(svc.render_prompt(main, None, {})) // 2)
+        expected = [identity, *main]
+        svc.encode_prompt(expected, None, {})
+        self.assertGreater(svc.prompts.last_reused, len(svc.render_prompt(expected, None, {})) // 2)
 
     def test_same_ids_as_a_full_encode_on_varied_conversations(self):
         import random
@@ -3548,7 +3551,7 @@ class WebApp(unittest.TestCase):
                     code, _, body = self.get(path)
                     self.assertEqual(code, 200)
                     models = json.loads(body)["data"]
-                    self.assertEqual(len(models), 1)
+                    self.assertEqual([card["id"] for card in models], [svc.model, "yuxi-v1"])
                     model = models[0]
                     self.assertEqual(model["id"], svc.model)
                     self.assertEqual(model["status"]["value"], "loaded")
@@ -5141,14 +5144,14 @@ class ModelAliases(unittest.TestCase):
 
     def test_models_lists_them(self):
         data = self.get("/v1/models")["data"]
-        self.assertEqual([m["id"] for m in data], ["qwen3.8-flash-next-iq3_xxs", "qwen", "local-model"])
+        self.assertEqual([m["id"] for m in data], ["qwen3.8-flash-next-iq3_xxs", "qwen", "local-model", "yuxi-v1"])
         self.assertEqual(data[0]["aliases"], ["qwen", "local-model"])
         self.assertEqual(data[1]["alias_of"], "qwen3.8-flash-next-iq3_xxs")
         self.assertEqual(self.get("/props?model=local-model")["model_alias"], "qwen3.8-flash-next-iq3_xxs")
 
     def test_requests_are_answered_under_the_alias(self):
         msgs = [{"role": "user", "content": "hi"}]
-        for asked, want in (("qwen", "qwen"), ("local-model", "local-model"),
+        for asked, want in (("qwen", "qwen"), ("local-model", "local-model"), ("yuxi-v1", "yuxi-v1"),
                             ("qwen3.8-flash-next-iq3_xxs", "qwen3.8-flash-next-iq3_xxs"),
                             ("something-else", "qwen3.8-flash-next-iq3_xxs")):    # still served, as before
             with self.subTest(asked=asked):
@@ -5161,19 +5164,38 @@ class ModelAliases(unittest.TestCase):
                 out = json.loads(self.post("/v1/messages", {"model": asked, "messages": msgs, "max_tokens": 8}))
                 self.assertEqual(out["model"], want)
 
-    def test_without_aliases_nothing_changes(self):
+    def test_without_configured_aliases_lists_the_public_alias(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/v1/models", timeout=30) as r:
                 data = json.loads(r.read())["data"]
-            self.assertEqual(len(data), 1)
+            self.assertEqual([m["id"] for m in data], [svc.model, "yuxi-v1"])
+            self.assertEqual(data[1]["alias_of"], svc.model)
             self.assertNotIn("aliases", data[0])
             self.assertEqual(svc.model_for({"model": "x"}), svc.model)
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_public_identity_reaches_the_model_once_in_each_protocol(self):
+        user = {"role": "user", "content": "hello"}
+        instruction = "Keep answers short."
+        for path, fields in (
+            ("/v1/chat/completions", {"messages": [{"role": "system", "content": instruction}, user]}),
+            ("/v1/messages", {"messages": [user], "system": instruction + "\n\nYou are yuxi-v1."}),
+            ("/v1/responses", {"input": [user], "instructions": instruction}),
+        ):
+            with self.subTest(path=path):
+                body = {"model": "yuxi-v1", "max_tokens": 8, "max_output_tokens": 16, **fields}
+                self.assertEqual(json.loads(self.post(path, body))["model"], "yuxi-v1")
+                prompt = self.svc.tok.decode(self.svc.engine.last_prompt)
+                self.assertEqual(prompt.count("You are yuxi-v1."), 1)
+                self.assertIn(instruction, prompt)
+                if path == "/v1/messages":
+                    count = json.loads(self.post(path + "/count_tokens", body))["input_tokens"]
+                    self.assertEqual(count, len(self.svc.engine.last_prompt))
 
 
 class AmdTelemetry(unittest.TestCase):

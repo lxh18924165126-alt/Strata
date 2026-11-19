@@ -24,6 +24,19 @@ test('model scope filters requests and does not add system RAM once per model',(
  const data=nativeMonitorData({instances:[instance,other],hardware:{gpus:[{index:0}]}},inventory,'one');assert.equal(data.requests.length,1);assert.equal(data.requests[0].instanceId,'one');assert.equal(data.hardware.ramUsedGb,20);
 });
 
+test('active requests retain their engine scope and per-request readings',()=>{
+ const withRequests=(id,requests)=>({...instance,id,metrics:{...instance.metrics,live:{...instance.metrics.live,requests}}});
+ const running={id:'r1',state:'generating',prompt_tokens:100,generated:20,max_tokens:400,max_context:32768,tok_s:13.5,elapsed_s:7};
+ const queued={id:'r2',state:'queued',prompt_tokens:200,max_tokens:500,elapsed_s:9};
+ const native={instances:[withRequests('one',[running,null]),withRequests('two',[queued])]};
+ assert.deepEqual(nativeMonitorData(native,inventory).activeRequests.map(r=>[r.id,r.instanceId,r.elapsed]),[['r2','two',9],['r1','one',7]]);
+ assert.deepEqual(nativeMonitorData(native,inventory,'one').activeRequests,[{
+  id:'r1',instanceId:'one',model:instance.label,state:'generating',promptTokens:100,outputTokens:20,
+  maxTokens:400,maxContext:32768,tps:13.5,elapsed:7,
+ }]);
+ assert.equal(nativeMonitorData(native,inventory,'two').activeRequests[0].outputTokens,null);
+});
+
 test('GPU histories retain their device scope and never spread one card reading across multiple GPUs',()=>{
  const two={...inventory,gpus:[...inventory.gpus,{id:'gpu1',index:1,vramGb:24,unified:false}]};
  const data=nativeMonitorData({instances:[instance],hardware:{gpus:[{index:0},{index:1}]}},two);

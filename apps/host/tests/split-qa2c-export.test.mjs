@@ -10,7 +10,7 @@ const read = path => readFile(new URL(path, import.meta.url), 'utf8').then(s => 
 
 test('with a model loaded the picture is headed by the logo and the line "<model> · <time>"; with none, "N loaded models"', async () => {
   const source = await read('../src/screens/Monitor.tsx');
-  assert.match(source, /const scopeLabel = selectedInstance \? instanceLabel\(selectedInstance\) : `\$\{runtime\?\.instances\.length \?\? 0\} loaded models`;/);
+  assert.match(source, /const scopeLabel = remote\?\.modelLabel \?\? \(selectedInstance \? instanceLabel\(selectedInstance\) : `\$\{runtime\?\.instances\.length \?\? 0\} loaded models`\);/);
   const header = /\{tr\(frozen \? <header className="section-toolbar">(.*?)<\/header> : null\)\}/s.exec(source)?.[1];
   assert.ok(header);
   assert.match(header, /<Brand variant="lockup"/); assert.doesNotMatch(header, /<h1/);

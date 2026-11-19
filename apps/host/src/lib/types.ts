@@ -268,7 +268,21 @@ export interface MonitorSample {
   cpus?: CpuReading[];
 }
 
+export interface ActiveMonitorRequest {
+  id: string;
+  instanceId: string;
+  model: string;
+  state: 'waiting' | 'queued' | 'reading' | 'generating';
+  promptTokens: number | null;
+  outputTokens: number | null;
+  maxTokens: number | null;
+  maxContext: number | null;
+  tps: number | null;
+  elapsed: number | null;
+}
+
 export interface MonitorState {
+  activeRequests?: ActiveMonitorRequest[];
   telemetry?: { throughput: string; thermals: string; memory: string; system?:string; context?: string; ttftMs?: number | null };
   phase: 'idle' | 'reading' | 'thinking' | 'generating' | 'loading' | 'error';
   phaseLabel: string;

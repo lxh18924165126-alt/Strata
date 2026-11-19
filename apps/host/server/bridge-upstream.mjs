@@ -24,7 +24,7 @@ export async function normalizeBridgeUrl(value, blockedPorts = []) {
   return url.toString().replace(/\/$/, '');
 }
 
-async function readBounded(response, limit = MAX_JSON_BYTES) {
+export async function readBounded(response, limit = MAX_JSON_BYTES) {
   let size = 0, text = ''; const decoder = new TextDecoder();
   if (response.body) for await (const chunk of response.body) {
     size += chunk.byteLength;
@@ -61,6 +61,44 @@ export async function discoverBridge({ baseUrl, apiKey, blockedPorts = [], fetch
     models.push({ id: m.id, name, contextMax, vision: Array.isArray(input) && input.every(x => typeof x === 'string') ? input.includes('image') : null });
   }
   return { baseUrl: base, models };
+}
+
+export async function readBridgeMonitor(config, blockedPorts) {
+  const base = await normalizeBridgeUrl(config.baseUrl, blockedPorts);
+  const origin = base.slice(0, -3);
+  const signal = AbortSignal.timeout(5000);
+  let response = await fetch(`${origin}/metrics?requests=all`, {
+    headers: { authorization: `Bearer ${config.apiKey}`, accept: 'application/json' },
+    redirect: 'manual', signal,
+  });
+  // Managed call keys may have no access to /metrics. Strata exposes the
+  // same aggregate telemetry to its own dashboard at this fixed path.
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel();
+    response = await fetch(`${origin}/api/monitor/metrics?requests=all`, {
+      headers: { accept: 'application/json' }, redirect: 'manual', signal,
+    });
+  }
+  if (!response.ok) {
+    await response.body?.cancel();
+    return null;
+  }
+  const metrics = JSON.parse(await readBounded(response, 2 * 1024 * 1024),
+    (_, value) => typeof value === 'string' ? value.replaceAll(config.apiKey, '[redacted]') : value);
+  const record = value => value && typeof value === 'object' && !Array.isArray(value);
+  const timestamp = value => Number.isFinite(value) && Math.abs(value) < 8.64e12;
+  if (!timestamp(metrics?.time) || !record(metrics.engine) || typeof metrics.engine.model !== 'string' ||
+      !record(metrics.live) || typeof metrics.live.state !== 'string' ||
+      !record(metrics.hardware) || !record(metrics.hardware_static) || !record(metrics.history) ||
+      !record(metrics.totals) || !timestamp(metrics.totals.since) || !Array.isArray(metrics.requests) ||
+      !metrics.requests.every(row => timestamp(row?.time)) ||
+      (metrics.hardware.gpus != null && (!Array.isArray(metrics.hardware.gpus) ||
+        !metrics.hardware.gpus.every(gpu => Number.isSafeInteger(gpu?.index))))) return null;
+  // Engine metadata can include paths and diagnostics. Send the fields used by the monitor.
+  const { model, max_context, expert_slots, experts, expert_cache_mib } = metrics.engine;
+  const { time, live, hardware, hardware_static, history, totals, requests, conversation_cache } = metrics;
+  return { time, live, hardware, hardware_static, history, totals, requests, conversation_cache,
+    engine: { model, max_context, expert_slots, experts, expert_cache_mib } };
 }
 
 export async function forwardBridge({ req, res, path, body, config, serving, onConnection, client, fetcher = fetch }) {

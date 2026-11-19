@@ -2,6 +2,16 @@ import { userError } from './format';
 /** Thin HTTP client for the Strata host. Zero deps, works in browser and Electron renderer. */
 
 const BASE = (globalThis as { __STRATA_HOST__?: string }).__STRATA_HOST__ ?? '';
+export { BASE as HOST_BASE };
+export const LOCAL_SERVICE = BASE ? window.location.origin : '';
+export const LOCAL_CALL_KEY = 'strata.local.callKey';
+
+export function localCallKey(): string {
+  const saved = sessionStorage.getItem(LOCAL_CALL_KEY);
+  if (saved !== null) return saved;
+  const legacy = JSON.parse(localStorage.getItem('strata.apikey') ?? 'null');
+  return typeof legacy === 'string' ? legacy : '';
+}
 
 export class ApiError extends Error {
   constructor(
@@ -86,9 +96,10 @@ export async function streamPost(
   onFrame: (frame: Record<string, unknown>) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const key = LOCAL_SERVICE && path === '/api/chat/stream' ? localCallKey() : '';
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body),
     signal,
   });

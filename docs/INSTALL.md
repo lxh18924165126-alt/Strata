@@ -60,6 +60,8 @@ startup time for every model or computer. Closing the desktop app stops its mana
 The provider order recommended here is **ISTA-DASLab, Unsloth, Gyro, then others**, when a compatible pack fits.
 Current app recommendations can differ; choose the model explicitly when you want a particular provider.
 
+To use a model running on another Ubuntu computer, see the [Ubuntu bridge setup and test guide](UBUNTU_BRIDGE.md).
+
 ## The Terminal
 
 Install once, then use `strata launch`. The Terminal includes Python and downloads the engine for your computer.

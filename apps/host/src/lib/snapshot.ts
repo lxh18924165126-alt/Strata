@@ -1,7 +1,9 @@
+import { HOST_BASE } from './client';
+
 /** Capture a complete view, including external SVG sprite symbols. */
 export async function monitorPng(element: HTMLElement) {
   await document.fonts.ready;
-  const [{ toPng }, spriteResponse] = await Promise.all([import('html-to-image'), fetch('/icons/sprite.svg')]);
+  const [{ toPng }, spriteResponse] = await Promise.all([import('html-to-image'), fetch(`${HOST_BASE}/icons/sprite.svg`)]);
   if (!spriteResponse.ok) throw new Error('Screenshot icons could not be loaded. Try again.');
   const sprite = new DOMParser().parseFromString(await spriteResponse.text(), 'image/svg+xml');
   const clone = element.cloneNode(true) as HTMLElement;

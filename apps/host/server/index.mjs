@@ -79,12 +79,13 @@ import { createShellNotifier, DEFAULT_PORT, parsePortNotice, readShellPrefs, wri
 import { findControl, createControl, componentsDirectory } from './control-runtime.mjs';
 import { listEngines, changeEngine } from './engine-library.mjs';
 import { forbidden as acquisitionForbidden } from './acquisition.mjs';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { nativeGateway } from './native-gateway.mjs';
 import { proxyCompletion } from './inference.mjs';
-import { apiPath } from './api-paths.mjs';
+import { apiPath, PUBLIC_MODEL, withModelAlias, withModelIdentity } from './api-paths.mjs';
 import { createBridgeSettings } from './bridge-settings.mjs';
-import { forwardBridge } from './bridge-upstream.mjs';
+import { forwardBridge, readBridgeMonitor } from './bridge-upstream.mjs';
+import { serveManagedApi } from './managed-api.mjs';
 import { findFreePort, listenProblem } from './ports.mjs';
 import { validateChatImages } from './chat-images.mjs';
 import { createTimeSkip, measureFolder, timeskipRevisionMessage, imageTypeOf } from './timeskip.mjs';
@@ -105,6 +106,10 @@ const DIST = process.env.STRATA_DIST
     : join(ROOT, 'dist');
 const PORT = Number(process.env.STRATA_PORT ?? 8791);
 const HOST = process.env.STRATA_BIND ?? '127.0.0.1';
+// Same local Strata origin that loads the service page, with an override for an explicit worker.
+const SERVICE_PAGE_ORIGIN = new URL(process.env.STRATA_SERVER_URL || 'http://127.0.0.1:18907').origin;
+const SERVICE_PAGE_ALIAS = SERVICE_PAGE_ORIGIN.replace(/:\/\/(localhost|127\.0\.0\.1)(?=:|$)/,
+  (_, name) => name === 'localhost' ? '://127.0.0.1' : '://localhost');
 /* The folder chats work in when nothing else is chosen. It is never the app's own folder (the host is started inside its install
    directory, so `process.cwd()` was "host" in the sidebar and the agent could read and write the app): the person's own
    Documents\Strata\Workspace (the models folder is next to it, not in it), created on first use, unless STRATA_WORKSPACE names one. */
@@ -671,7 +676,7 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
   }
 }
 
-async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0 }) {
+async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0, baseSystem = SYSTEM_PROMPT }) {
   if (bridge.config().enabled) {
     const { model } = bridge.config();
     const applied = selectSkills(skillState, message, workspaceId);
@@ -726,7 +731,7 @@ async function runTurn({ message, history = [], onFrame, signal, client, workspa
       // Scope is resolved again at dispatch: a disabled skill never stays active
       // merely because the request waited in the queue.
       const appliedSkills = selectSkills(skillState, message, workspaceId);
-      const systemPrompt = [SYSTEM_PROMPT, skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
+      const systemPrompt = [baseSystem, skillInstructions(appliedSkills)].filter(Boolean).join('\n\n');
       serving.mark(entry.id, { state: 'generating' });
       const contextMax = instance.memory.context;
       const modelMonitor=models.REAL?monitor:{
@@ -1050,7 +1055,7 @@ async function changeBridge(req, res) {
   } finally { bridgeChanging = false; }
 }
 
-async function bridgeForward(req, res, path, client) {
+async function bridgeForward(req, res, path, client, publicApi = false) {
   if (bridgeChanging) return error(res, 503, 'Wait for Strata to finish switching the bridge mode.');
   const config = bridge.config();
   if (!config.enabled) return error(res, 503, 'Bridge mode is off.');
@@ -1060,7 +1065,7 @@ async function bridgeForward(req, res, path, client) {
     try { body = await readBody(req, 12 * 1024 * 1024); }
     catch (err) { return error(res, 400, err.message); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error(res, 400, 'Body must be a JSON object.');
-    return await forwardBridge({ req, res, path, body, client, serving, config: { ...config, blockedPorts: bridgePorts }, onConnection: message => bridge.connection(message, config) });
+    return await forwardBridge({ req, res, path, body: publicApi ? withModelIdentity(path, body) : body, client, serving, config: { ...config, blockedPorts: bridgePorts }, onConnection: message => bridge.connection(message, config) });
   } finally { modelRequests--; }
 }
 
@@ -1069,14 +1074,17 @@ const server = http.createServer(async (req, res) => {
   if (!url) return badRequest(res);   // #4397: a bad Host or request target is a 400, never an unhandled rejection
   const path = url.pathname;
   const method = req.method ?? 'GET';
-  const bridgeControl = path === '/api/bridge' || path.startsWith('/api/bridge/');
-  if ((bridgeControl || bridgeChanging || bridge.config().enabled) && (path.startsWith('/api/') || path.startsWith('/v1/')) && !localBridgeRequest(req, url)) {
+  const bridgeControl = path === '/api/bridge' || path.startsWith('/api/bridge/') ||
+    path === '/api/upstream' || path.startsWith('/api/upstream/');
+  const localRequest = localBridgeRequest(req, url);
+  if ((bridgeControl || bridgeChanging || bridge.config().enabled) && (path.startsWith('/api/') || path.startsWith('/v1/')) && !localRequest) {
     return error(res, 403, 'Bridge mode is available on this computer only.');
   }
 
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-headers', 'content-type, authorization, x-api-key, x-strata-client');
-  res.setHeader('access-control-allow-methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  const localOrigin = req.headers.origin && localRequest;
+  res.setHeader('access-control-allow-headers', `content-type, authorization, x-api-key, x-strata-client${localOrigin ? ', x-strata-window, x-strata-base-rev' : ''}`);
+  res.setHeader('access-control-allow-methods', localOrigin ? 'GET, POST, PUT, PATCH, DELETE, OPTIONS' : 'GET, POST, PATCH, DELETE, OPTIONS');
   if (method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -1117,8 +1125,33 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function api(req, res, path, method, url) {
+  if (path === '/api/upstream' || path.startsWith('/api/upstream/')) {
+    const target = () => {
+      const ready = native.readyInstances();
+      const instance = ready.find(item => item.id === native.defaultInstanceId()) ?? ready[0];
+      if (!instance) return null;
+      const base = `http://127.0.0.1:${instance.port}/v1`;
+      return { base, identity: `${base}/${instance.id}/${instance.loadedAt}` };
+    };
+    const service = target();
+    return serveManagedApi(req, res, url, method, service && {
+      id: createHash('sha256').update(service.identity).digest('hex').slice(0, 32),
+      baseUrl: () => service.base,
+      current: () => target()?.identity === service.identity,
+    });
+  }
   if (path === '/api/bridge' && method === 'GET') return json(res, 200, bridge.state());
   if (path === '/api/bridge' && method === 'PATCH') return changeBridge(req, res);
+  if (path === '/api/bridge/monitor' && method === 'GET') {
+    const config = bridge.config();
+    const unavailable = 'Remote monitoring data is unavailable.';
+    if (!config.enabled || bridgeChanging) return error(res, 409, unavailable);
+    let metrics;
+    try { metrics = await readBridgeMonitor(config, bridgePorts); }
+    catch { return error(res, 502, unavailable); }
+    if (config !== bridge.config() || bridgeChanging) return error(res, 409, unavailable);
+    return metrics ? json(res, 200, metrics) : error(res, 502, unavailable);
+  }
   if (path === '/api/bridge/test' && method === 'POST') {
     const body = await readBody(req);
     const current = bridge.config();
@@ -2219,13 +2252,16 @@ async function api(req, res, path, method, url) {
   // --- chat ---------------------------------------------------------------
   if ((path === '/api/chat/stream' || path === '/api/plan/start-goal') && method === 'POST') {
     const body = await readBody(req,12*1024*1024);
+    // The service page served by serve/web/desktop-entry.js keeps its own API
+    // admission and usage ledger, even when it sends inference over the bridge.
+    const servicePage = path === '/api/chat/stream' && [SERVICE_PAGE_ORIGIN, SERVICE_PAGE_ALIAS].includes(req.headers.origin);
     if (path === '/api/plan/start-goal') { body.message = '/plan start'; if (typeof body.planId !== 'string') return error(res, 400, 'planId is required'); }
     let images;try{const named=Array.isArray(body.imageIds)&&body.imageIds.length?uploads.dataUrls(typeof body.sessionId==='string'?body.sessionId:'',body.imageIds):[];images=validateChatImages([...(Array.isArray(body.images)?body.images:[]),...named]);}catch(e){return error(res,400,e.message);}
     if (images.length && bridge.config().enabled) {
       if (bridge.config().model.vision !== true) return error(res, 409, 'The bridge model does not report picture support.');
     }
     else if(images.length&&body.remoteModel){const own=modelProviders.withSecrets().find(c=>c.id===body.remoteModel.connectionId);const row=own?.models.find(m=>m.id===body.remoteModel.modelId);const refused=await pictureRefusal(own,row);if(refused)return error(res,409,refused);}
-    else if(images.length){let selected;try{selected=native.resolveInstance(body.nativeModelId??native.state().defaultId);}catch(e){return error(res,409,e.message);}if(!selected.vision)return error(res,409,'This model was started without picture reading. Open Models, turn on Read pictures and load it again, or choose a model that reads pictures.');}
+    else if(images.length&&!servicePage){let selected;try{selected=native.resolveInstance(body.nativeModelId??native.state().defaultId);}catch(e){return error(res,409,e.message);}if(!selected.vision)return error(res,409,'This model was started without picture reading. Open Models, turn on Read pictures and load it again, or choose a model that reads pictures.');}
     // The goal bar's Resume has no words of its own: it is the same turn as "/goal resume".
     const message = body.goalAction === 'resume' ? '/goal resume' : String(body.message ?? '').trim();
     if (!message) return error(res, 400, 'message is required');
@@ -2241,6 +2277,32 @@ async function api(req, res, path, method, url) {
     keepStreamAlive(res);   // #4878: a quiet turn stays open; the timer ends with the response
     const controller = new AbortController();
     res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+    if (servicePage) {
+      const write = frame => { if (!res.destroyed) res.write(`${JSON.stringify(frame)}\n`); };
+      try {
+        const authorization = /^Bearer (.+)$/i.exec(req.headers.authorization ?? '')?.[1];
+        if (!authorization) throw new Error('请先在 API 指南中保存本机服务的调用 Key。');
+        const base = SERVICE_PAGE_ORIGIN;
+        const signal = controller.signal;
+        const health = await fetch(`${base}/health`, { redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]) });
+        const info = await health.json();
+        if (!health.ok || info?.service !== 'strata' || typeof info.model !== 'string') throw new Error('本机 Strata 服务不可用。');
+        const thinking = String(body.thinking ?? 'high').toLowerCase();
+        const reasoning = { off: 'none', max: 'high' }[thinking] ?? thinking;
+        const budget = Number.isInteger(body.thinkingBudget) ? Math.min(body.thinkingBudget, 262144) : 0;
+        await proxyCompletion({
+          baseUrl: `${base}/v1`, modelId: info.model, authorization, message, images,
+          history: Array.isArray(body.history) ? body.history : [], signal, reportedOnly: true,
+          extra: { strata_mcp: body.useTools === true, reasoning_effort: reasoning,
+            ...(budget > 0 && reasoning !== 'none' ? { reasoning_budget_tokens: budget } : {}) },
+          onFrame: write,
+        });
+      } catch (err) {
+        write({ type: 'error', message: err.message });
+      }
+      res.end();
+      return undefined;
+    }
 
     /* Agent turn, when the component is there and this request can use it. A client that disappears
        detaches from the turn (it keeps running in the Harness); Stop is its own request. */
@@ -2292,17 +2354,21 @@ async function api(req, res, path, method, url) {
 async function openai(req, res, path, method) {
   if (!serving.authorized(req)) return error(res, 401, 'Invalid API key');
   if (bridgeChanging) return error(res, 503, 'Wait for Strata to finish switching the bridge mode.');
+  if (req.headers['x-strata-bridge-only'] === '1' && !bridge.config().enabled) {
+    return error(res, 409, 'Bridge mode is unavailable.');
+  }
   if (bridge.config().enabled) {
     if (req.socket.localPort !== PORT) return error(res, 403, 'Bridge mode is available on this computer only.');
     const route = path.replace(/\/+$/, '');
     if (route === '/v1/models' && method === 'GET') {
       const { model } = bridge.config();
-      return json(res, 200, { object: 'list', data: [{ id: model.id, object: 'model', owned_by: 'strata', meta: { n_ctx: model.contextMax },
-        ...(model.vision !== null ? { architecture: { input_modalities: model.vision ? ['text', 'image'] : ['text'], output_modalities: ['text'] } } : {}) }] });
+      const card = { id: model.id, object: 'model', owned_by: 'strata', meta: { n_ctx: model.contextMax },
+        ...(model.vision !== null ? { architecture: { input_modalities: model.vision ? ['text', 'image'] : ['text'], output_modalities: ['text'] } } : {}) };
+      return json(res, 200, { object: 'list', data: withModelAlias([card], card) });
     }
     if (method !== 'POST' || !bridgePosts.has(route)) return error(res, 404, 'Unknown bridge endpoint.');
     if (store.get().serving?.pauseServing && route !== '/v1/messages/count_tokens') return error(res, 503, 'New API requests are paused. Resume them in Serving.');
-    return bridgeForward(req, res, route, clientName(req));
+    return bridgeForward(req, res, route, clientName(req), true);
   }
   modelRequests++;
   try { return await localOpenai(req, res, path, method); }
@@ -2311,14 +2377,25 @@ async function openai(req, res, path, method) {
 
 async function localOpenai(req, res, path, method) {
   if(native.state().instances.length){
-    if(path==='/v1/models'&&method==='GET')return json(res,200,{object:'list',data:native.state().instances.filter(i=>i.status==='ready').map(i=>({id:i.apiModelId,object:'model',owned_by:'strata',meta:{instanceId:i.id,gpus:i.gpus,label:i.label,aliases:i.aliases}}))});
-    if(method==='POST'&&['/v1/chat/completions','/v1/messages','/v1/responses'].includes(path)){if(store.get().serving?.pauseServing)return error(res,503,'New API requests are paused.');if(path==='/v1/responses'&&!native.state().capabilities.responses)return error(res,501,'Update the native Strata installation to use the Responses API.');return nativeGateway({req,res,path,body:await readBody(req,12*1024*1024),control:native,serving});}
+    if (path === '/v1/models' && method === 'GET') {
+      const data = native.readyInstances().map(i => ({ id: i.apiModelId, object: 'model', owned_by: 'strata',
+        meta: { instanceId: i.id, gpus: i.gpus, label: i.label, aliases: i.aliases } }));
+      return json(res, 200, { object: 'list', data: withModelAlias(data, data.find(m => m.meta.instanceId === native.defaultInstanceId())) });
+    }
+    if (method === 'POST' && bridgePosts.has(path)) {
+      if (store.get().serving?.pauseServing && path !== '/v1/messages/count_tokens') return error(res, 503, 'New API requests are paused.');
+      if (path === '/v1/responses' && !native.state().capabilities.responses) return error(res, 501, 'Update the native Strata installation to use the Responses API.');
+      return nativeGateway({ req, res, path, body: await readBody(req, 12 * 1024 * 1024), control: native, serving });
+    }
   }
   if(path==='/v1/responses'&&method==='POST')return error(res,503,'Load a native Strata model to use the Responses API.');
 
   if (path === '/v1/models' && method === 'GET') {
     const runtime=runtimeState();
-    return json(res,200,{object:'list',data:runtime.instances.map(i=>({id:i.apiModelId,object:'model',created:Math.floor(new Date(i.loadedAt).getTime()/1000),owned_by:'strata',meta:{label:i.family,context:i.memory.context,instanceId:i.id,gpuIds:i.gpuIds,mode:runtime.mode}}))});
+    const data = runtime.instances.map(i => ({ id: i.apiModelId, object: 'model',
+      created: Math.floor(new Date(i.loadedAt).getTime() / 1000), owned_by: 'strata',
+      meta: { label: i.family, context: i.memory.context, instanceId: i.id, gpuIds: i.gpuIds, mode: runtime.mode } }));
+    return json(res, 200, { object: 'list', data: withModelAlias(data, data.find(m => m.meta.instanceId === runtime.defaultId)) });
   }
 
   if ((path === '/v1/chat/completions' || path === '/v1/messages') && method === 'POST') {
@@ -2346,9 +2423,17 @@ async function localOpenai(req, res, path, method) {
 
     if (!text) return error(res, 400, 'No user message found');
 
+    const [system] = messages;
+    const clientSystem = system.role === 'system' || system.role === 'developer';
+    const content = clientSystem
+      ? (Array.isArray(system.content) ? system.content.map(part => part.text ?? '').join('') : system.content)
+      : '';
+    const baseSystem = withModelIdentity('/v1/messages', { system: content }).system;
+    const turns = messages.slice(clientSystem ? 1 : 0, -1);
+
     runtimeState();
     let loaded;
-    try{loaded=runtimeModels.resolve(body.model);}
+    try{loaded=body.model === PUBLIC_MODEL ? runtimeModels.resolve(undefined, { chatDefault: true }) : runtimeModels.resolve(body.model);}
     catch(err){return error(res,409,err.message);}
     loaded={...loaded,id:loaded.apiModelId};
 
@@ -2364,8 +2449,9 @@ async function localOpenai(req, res, path, method) {
       let usage = { tokensIn: null, tokensOut: null };
       const result = await runTurn({
         message: text,
+        baseSystem,
         runtimeModelId:loaded.apiModelId,
-        history: messages.slice(0, -1),
+        history: turns,
         onFrame: (frame) => {
           if (frame.type === 'delta') out += frame.text;
           if (frame.type === 'done') usage = { tokensIn: frame.tokensIn, tokensOut: frame.tokensOut };
@@ -2410,8 +2496,9 @@ async function localOpenai(req, res, path, method) {
 
     await runTurn({
       message: text,
+      baseSystem,
       runtimeModelId:loaded.apiModelId,
-      history: messages.slice(0, -1),
+      history: turns,
       workspaceId,
       onFrame: (frame) => {
         if (frame.type === 'delta') {

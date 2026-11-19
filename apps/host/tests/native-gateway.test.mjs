@@ -13,7 +13,7 @@ test('native gateway preserves all three protocols and routes exact IDs, usage, 
  });const port=await listen(engine);
  const instances=[{id:'first',apiModelId:'native-a',model:'iq2_xs',port,key:'private-a',gpus:[0]},{id:'second',apiModelId:'native-b',model:'iq3_s',port,key:'private-b',gpus:[1]}];
  const serving={open:value=>{const record={...value,id:String(records.length)};records.push(record);return record;},mark:(id,value)=>Object.assign(records[Number(id)],value),finish:(id,value)=>Object.assign(records[Number(id)],value)};
- const control={resolveInstance:id=>{const found=instances.find(i=>i.apiModelId===id);if(!found)throw new Error('Choose an exact loaded ID');return found;}};
+ const control={defaultInstanceId:()=>instances[1].id,resolveInstance:id=>{const found=instances.find(i=>i.id===id||i.apiModelId===id);if(!found)throw new Error('Choose an exact loaded ID');return found;}};
  const gateway=http.createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;await nativeGateway({req,res,path:req.url,body:JSON.parse(text),control,serving});});const publicPort=await listen(gateway);
  const call=async(path,body)=>fetch(`http://127.0.0.1:${publicPort}${path}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
  try{
@@ -25,6 +25,17 @@ test('native gateway preserves all three protocols and routes exact IDs, usage, 
   result=await call('/v1/responses',{model:'missing',input:'Hello'});assert.equal(result.status,400);assert.equal((await result.json()).error.param,'model');
   result=await call('/v1/responses',{model:'native-b',input:'fail'});assert.equal(result.status,422);assert.equal((await result.json()).error.message,'Invalid native input');
   result=await call('/v1/responses',{model:'native-a',input:'slow',stream:true});const read=result.body.getReader();await read.read();await read.cancel();for(let n=0;n<30&&!cancelled;n++)await new Promise(r=>setTimeout(r,20));assert.equal(cancelled,true);
+  const messages=[{role:'system',content:'Keep answers short.'},{role:'user',content:'Hello'}];
+  result=await call('/v1/chat/completions',{model:'yuxi-v1',messages:JSON.stringify(messages)});
+  assert.equal(result.status,200);await result.text();
+  assert.equal(received.at(-1).body.model,'native-b');
+  assert.deepEqual(received.at(-1).body.messages,[{role:'system',content:'Keep answers short.\n\nYou are yuxi-v1.'},messages[1]]);
+  const before=records.length;
+  result=await call('/v1/messages/count_tokens',{model:'yuxi-v1',system:'You are yuxi-v1.',messages:messages.slice(1),stream:true});
+  assert.equal(result.status,200);await result.text();
+  assert.equal(received.at(-1).body.system,'You are yuxi-v1.');
+  assert.equal(received.at(-1).body.stream,undefined);
+  assert.equal(records.length,before);
  }finally{await close(gateway);await close(engine);}
 });
 test('a client that hangs up right after data: [DONE] has its answer: the request is done, not "Request cancelled." (#4690)',{timeout:30000},async()=>{

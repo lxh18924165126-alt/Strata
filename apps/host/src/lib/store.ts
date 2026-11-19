@@ -41,6 +41,7 @@ import { catalogLoaded, loadCatalog, setTranslationLanguage, tr, validLanguage, 
  */
 import { useSyncExternalStore } from 'react';
 import { api, ApiError, onEvent, streamPost, type StreamEvent } from './client';
+import { isServicePage } from './service-page';
 import type {
   Workspace,
   ChatMessage,
@@ -978,7 +979,7 @@ export async function bootstrap() {
       }
       set({ connection: status });
     });
-    if (!setup.complete && !setup.dismissed && !window.location.hash.includes('setup')) navigate('setup');
+    if (!isServicePage() && !bridge.enabled && !setup.complete && !setup.dismissed && !window.location.hash.includes('setup')) navigate('setup');
   } catch (err) {
     set({ ready: true, connection: 'offline' });
     pushToast(

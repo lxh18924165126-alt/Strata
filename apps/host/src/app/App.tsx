@@ -15,12 +15,14 @@ import { Btn, Dialog, IconBtn, Toasts } from '../components/ui';
 import { Brand } from '../components/Brand';
 import { BridgeDialog } from '../components/BridgeDialog';
 import { ChatScreen } from '../screens/Chat';
+import { isServicePage } from '../lib/service-page';
 import { lazyScreen, useLoadedModule } from '../lib/lazy-screen';
 // The start screen is Chat. Every other screen loads the first time it is opened (7.1), so the first start reads and runs less code.
 const loadSetup = () => import('../screens/Setup');
 const loadSettings = () => import('../screens/Settings');
 const ModelRunScreen = lazyScreen(() => import('../screens/ModelRun'), (m) => m.ModelRunScreen);
 const ServingScreen = lazyScreen(() => import('../screens/Serving'), (m) => m.ServingScreen);
+const ServiceApiScreen = lazyScreen(() => import('../screens/ServiceApi'), (m) => m.ServiceApiScreen);
 const MonitorScreen = lazyScreen(() => import('../screens/Monitor'), (m) => m.MonitorScreen);
 const TasksScreen = lazyScreen(() => import('../screens/Tasks'), (m) => m.TasksScreen);
 const SkillsScreen = lazyScreen(() => import('../screens/Skills'), (m) => m.SkillsScreen);
@@ -52,7 +54,7 @@ function AppShell() {
     // First run is a modal over the working shell rather than a takeover: the app
     // is visibly there behind it, which is far less daunting than a blank window
     // demanding five steps before anything appears.
-    const setupOpen = !bridge?.enabled && (location.route === 'setup' || (!!setup && !setup.complete && !setup.dismissed) || firstRunOpen);
+    const setupOpen = !bridge?.enabled && (location.route === 'setup' || firstRunOpen || (!isServicePage() && !!setup && !setup.complete && !setup.dismissed));
     // Hook runs here, after setupOpen exists — see src/lib/focus.ts.
     // The dialogs open once their code has loaded, so they appear and take focus exactly as before.
     const setupCode = useLoadedModule(loadSetup, setupOpen);
@@ -74,7 +76,7 @@ function AppShell() {
         <div className="bridge-bar"><Btn size="sm" icon="link" active={!!bridge?.enabled} title={bridge?.error ?? undefined} onClick={() => setBridgeOpen(true)}>{tr(!bridge?.enabled ? "Bridge" : bridge.status === 'error' ? "Bridge error" : bridge.status === 'idle' ? "Bridge idle" : "Bridge on")}</Btn></div>
         <ConnectionBar />
         {tr(focus && location.route === 'chat' ? <FocusBar /> : null)}
-        {tr(!ready ? <BootSkeleton /> : <Suspense fallback={<BootSkeleton />}><RouteView route={routeShown}/></Suspense>)}
+        {tr(!ready ? <BootSkeleton /> : <Suspense fallback={<BootSkeleton />}><RouteView route={routeShown} param={location.param}/></Suspense>)}
       </main>
       <CommandPalette open={paletteOpen}/>
       <Dialog open={settingsWanted && !!settingsCode} title={tr("Settings")} className="settings-dialog" onClose={closeSettings}>{settingsCode ? <settingsCode.SettingsScreen /> : null}</Dialog>
@@ -170,8 +172,9 @@ function FocusBar() {
       <IconBtn name="x" title={tr("Leave focus mode")} onClick={() => setFocus(false)}/>
     </div>);
 }
-function RouteView({ route }: {
+function RouteView({ route, param }: {
     route: string;
+    param: string | null;
 }) {
     switch (route) {
         case 'chat':
@@ -180,7 +183,7 @@ function RouteView({ route }: {
         case 'tuning':
             return <ModelRunScreen />;
         case 'serving':
-            return <ServingScreen />;
+            return param === 'service-api' ? <ServiceApiScreen /> : <ServingScreen />;
         case 'monitor':
             return <MonitorScreen />;
         case 'tasks':

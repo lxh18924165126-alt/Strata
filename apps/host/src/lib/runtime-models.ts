@@ -1,6 +1,6 @@
 import type { Hardware, MonitorState, RuntimeModel, RuntimeModels, ServeRequest } from './types';
 import { gpuId } from './monitor-hardware';
-export function deviceLabel(ids:string[],hardware:Hardware|null){
+export function deviceLabel(ids:string[],hardware:Pick<Hardware,'gpus'>|null){
   if(!ids.length)return 'CPU only';
   return ids.map(id=>{const index=hardware?.gpus.findIndex(g=>gpuId(g)===id)??-1;return index>=0?`GPU ${index+1}`:'GPU unavailable';}).join(' + ');
 }

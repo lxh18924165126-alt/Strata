@@ -10,6 +10,7 @@ import { FloatingMenu } from '../components/FloatingMenu';
 import { measureFrame } from '../lib/overlay-place';
 import { QuitStrataDialog } from '../components/QuitStrata';
 import { useAppMode } from '../lib/app-mode';
+import { isServicePage } from '../lib/service-page';
 import { href, useLocation, type Route } from '../lib/router';
 import { cx, relTime, relTimeShort } from '../lib/format';
 import { useMedia } from '../lib/responsive';
@@ -25,6 +26,8 @@ export function Sidebar({ containerRef }: {
 }) {
     useBindings();
     const location = useLocation();
+    const servicePage = isServicePage();
+    const serviceApiSelected = servicePage && location.route === 'serving' && location.param === 'service-api';
     const compact = useMedia('(max-width: 1279px)');
     const rail = useStore(s => s.rail);
     const theme = useStore(s => s.theme);
@@ -114,8 +117,9 @@ export function Sidebar({ containerRef }: {
         <button className="enginechip" data-state={status === 'Ready' ? 'ready' : ['Reading prompt', 'Thinking', 'Generating', 'Loading'].includes(status) ? 'busy' : 'off'} onClick={() => go(bridge?.enabled ? 'monitor' : 'models')} title={tr("{0} \u00B7 {1} \u00B7 {2}", [modelName, workingLine ?? modelQuant, tr(status)])} aria-label={tr("{0} \u00B7 {1}", [modelName, modelQuant])}><span className="enginechip__family"><Icon name={bridge?.enabled ? 'link' : modelFamilyIcon(current?.family)} size={20}/><span className="enginechip__dot"/></span><span className="enginechip__text nav__rail-hide"><span className="enginechip__title">{modelName}</span><span className="enginechip__sub">{workingLine ?? modelQuant}</span></span></button>
         <NavLink route="skills" label={tr("Skills")} icon="skills" current={location.route}/>
         <NavLink route="monitor" label={tr("Monitor")} icon="activity" current={location.route}/>
+        {servicePage ? <NavLink route="serving" param="service-api" label={tr("API keys and usage")} icon="shield" current={serviceApiSelected ? 'serving' : ''}/> : null}
         <NavLink route="models" label={tr("Models")} icon="models" current={location.route === 'tuning' ? 'models' : location.route}/>
-        <div className="nav__bottom"><MoreMenu current={location.route}/><button className="st-btn st-btn--icon theme-switch" aria-label={tr(dark ? 'Switch to light mode' : 'Switch to dark mode')} title={tr(dark ? 'Switch to light mode' : 'Switch to dark mode')} onClick={() => setTheme(dark ? 'light' : 'dark')}><span key={String(dark)} className="theme-switch__icon"><Icon name={dark ? 'sun' : 'moon'} size={19}/></span></button></div>
+        <div className="nav__bottom"><MoreMenu current={serviceApiSelected ? '' : location.route}/><button className="st-btn st-btn--icon theme-switch" aria-label={tr(dark ? 'Switch to light mode' : 'Switch to dark mode')} title={tr(dark ? 'Switch to light mode' : 'Switch to dark mode')} onClick={() => setTheme(dark ? 'light' : 'dark')}><span key={String(dark)} className="theme-switch__icon"><Icon name={dark ? 'sun' : 'moon'} size={19}/></span></button></div>
       </div>
     </aside>
     {tr(menuId && menuSession ? <FloatingMenu anchor={menuTrigger.current} title={tr("Actions for {0}", [sessionTitle(menuSession)])} onClose={closeMenu}>
@@ -184,14 +188,15 @@ function RecentChatLink({ session, active, slot }: {
     {open ? createPortal(<div ref={tooltip} id={id} role="tooltip" className="nav-chat-tooltip" style={position}><strong>{sessionTitle(session)}</strong><span>{session.messages.length ? recentChatDescription(session) : tr(recentChatDescription(session))}</span>{tr(binding ? <kbd className="nav-chat-shortcut">{tr(keys.join(" "))}</kbd> : null)}</div>, document.body) : null}
   </>;
 }
-function NavLink({ route, label, icon, current, meta }: {
+function NavLink({ route, param, label, icon, current, meta }: {
     route: Route;
+    param?: string;
     label: string;
     icon: IconName;
     current: string;
     meta?: string;
 }) {
-    return <a className="navitem" href={href(route)} aria-current={current === route ? 'page' : undefined} title={tr(label)} aria-label={tr(label)}><Icon name={icon}/><span className="navitem__text">{tr(label)}</span>{tr(meta ? <span className="navitem__meta">{tr(meta)}</span> : null)}</a>;
+    return <a className="navitem" href={href(route, param)} aria-current={current === route ? 'page' : undefined} title={tr(label)} aria-label={tr(label)}><Icon name={icon}/><span className="navitem__text">{tr(label)}</span>{tr(meta ? <span className="navitem__meta">{tr(meta)}</span> : null)}</a>;
 }
 function MoreMenu({ current }: {
     current: string;

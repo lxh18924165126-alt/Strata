@@ -3,6 +3,7 @@ import { tr } from '../lib/i18n';
 import { useEffect, useState, type CSSProperties } from 'react';
 import { useMedia } from '../lib/responsive';
 import { useStore } from '../lib/store';
+import { HOST_BASE } from '../lib/client';
 export function Brand({ variant, height, decorative = false, className = '', }: {
     variant: 'mark' | 'lockup';
     height: number;
@@ -12,7 +13,7 @@ export function Brand({ variant, height, decorative = false, className = '', }: 
     const preference = useStore(s => s.theme);
     const systemDark = useMedia('(prefers-color-scheme: dark)');
     const theme = preference === 'system' ? (systemDark ? 'dark' : 'light') : preference;
-    const src = `/brand/strata-${variant}-${theme}.svg`;
+    const src = `${HOST_BASE}/brand/strata-${variant}-${theme}.svg`;
     const [failed, setFailed] = useState(false);
     useEffect(() => setFailed(false), [src]);
     const width = variant === 'mark' ? height : height * 182 / 48;

@@ -1,5 +1,5 @@
-import type {NativeState} from './native';
-import type {Hardware,MonitorState,MonitorSample,GpuReading,ServeRequest} from './types';
+import type {NativeInstance,NativeState} from './native';
+import type {ActiveMonitorRequest,Hardware,MonitorState,MonitorSample,GpuReading,ServeRequest} from './types';
 import {gpuId,gpuCapacity,hasReading} from './monitor-hardware';
 const value=(n:unknown)=>hasReading(n)?n:null;
 const bytes=(n:unknown)=>hasReading(n)?n/1024**3:null;
@@ -7,11 +7,21 @@ const reading=(n:unknown)=>value(n)??NaN;
 const total=(list:(number|null)[])=>list.length&&list.every(hasReading)?list.reduce((sum,n)=>sum+n,0):NaN;
 
 /** Native engine facts projected onto the existing visual dashboard. No demo fallback. */
-export function nativeMonitorData(native:NativeState,inventory:Hardware|null,selection='all'):MonitorState{
+export function nativeMonitorData(native:{instances:Pick<NativeInstance,'id'|'label'|'model'|'phase'|'metrics'|'gpus'|'error'|'context'|'loadedAt'>[];hardware?:NativeState['hardware']},inventory:Pick<Hardware,'gpus'> & {memory?: Pick<Hardware['memory'],'totalGb'>} | null,selection='all'):MonitorState{
  const instances=native.instances,selected=instances.find(instance=>instance.id===selection)??(instances.length===1?instances[0]:undefined);
  const scoped=selected?[selected]:instances;
  const raw=selected?.metrics??scoped.filter(instance=>instance.metrics).sort((a,b)=>(b.metrics?.time??0)-(a.metrics?.time??0))[0]?.metrics;
  const live=selected?.metrics?.live,engine=selected?.metrics?.engine;
+ const activeRequests:ActiveMonitorRequest[]=scoped.flatMap(instance=>{
+  const rows=instance.metrics?.live?.requests;
+  if(!Array.isArray(rows))return [];
+  return rows.flatMap(row=>{
+   if(typeof row?.id!=='string'||!['waiting','queued','reading','generating'].includes(row.state))return [];
+   return [{id:row.id,instanceId:instance.id,model:instance.label,state:row.state,promptTokens:value(row.prompt_tokens),
+    outputTokens:value(row.generated),maxTokens:value(row.max_tokens),maxContext:value(row.max_context),
+    tps:value(row.tok_s),elapsed:value(row.elapsed_s)}];
+  });
+ }).sort((a,b)=>(b.elapsed??0)-(a.elapsed??0));
  const hardware=instances.filter(instance=>instance.metrics?.hardware).sort((a,b)=>(b.metrics?.time??0)-(a.metrics?.time??0))[0]?.metrics?.hardware;
  const devices=new Map<number,Record<string,any>>();
  for(const instance of [...instances].sort((a,b)=>(a.metrics?.time??0)-(b.metrics?.time??0))){
@@ -20,7 +30,7 @@ export function nativeMonitorData(native:NativeState,inventory:Hardware|null,sel
   else{const index=instance.gpus.length===1?instance.gpus[0]:native.hardware?.gpus.length===1?native.hardware.gpus[0].index:null;if(index!==null)devices.set(index,{util:h.gpu_util,mem_used:h.gpu_mem_used,temp:h.gpu_temp,power:h.gpu_power,power_limit:h.gpu_power_limit,pcie_rx_mb:h.gpu_pcie_rx_mb,pcie_gen:h.gpu_pcie_gen,pcie_gen_max:h.gpu_pcie_gen_max,pcie_width:h.gpu_pcie_width});}
  }
  const gpus:GpuReading[]=(inventory?.gpus??[]).map(gpu=>{const r=devices.get(gpu.index);return{id:gpuId(gpu),utilizationPct:value(r?.util),memoryUsedGb:bytes(r?.mem_used),temperatureC:value(r?.temp),powerW:value(r?.power),powerLimitW:value(r?.power_limit),pcieRxMbs:value(r?.pcie_rx_mb),pcieGen:value(r?.pcie_gen),pcieGenMax:value(r?.pcie_gen_max),pcieWidth:value(r?.pcie_width),source:r?'sensor':'unavailable',sampledAt:new Date((raw?.time??Date.now()/1000)*1000).toISOString()};});
- const requests:ServeRequest[]=scoped.flatMap(instance=>(instance.metrics?.requests??[]).map((r:Record<string,any>,index:number)=>({id:String(r.id??`${instance.id}:${r.time}:${index}`),instanceId:instance.id,at:new Date((r.time??0)*1000).toISOString(),client:'Native engine',endpoint:'/v1/chat/completions',state:r.error?'error' as const:'done' as const,tokensIn:value(r.prompt_tokens),tokensOut:value(r.output_tokens),cachedTokens:value(r.reused),durationMs:reading(r.duration_s)*1000,model:instance.label,tps:value(r.decode_tok_s),peakTps:value(r.decode_peak_tok_s),promptTps:hasReading(r.prompt_ms)&&r.prompt_ms>0&&hasReading(r.prompt_tokens)&&hasReading(r.reused)?(r.prompt_tokens-r.reused)/(r.prompt_ms/1000):null,usageSource:'reported' as const,finishReason:r.finish_reason}))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at));
+ const requests:ServeRequest[]=scoped.flatMap(instance=>(instance.metrics?.requests??[]).map((r:Record<string,any>,index:number)=>({id:String(r.id??`${instance.id}:${r.time}:${index}`),instanceId:instance.id,at:new Date((r.time??0)*1000).toISOString(),client:'Native engine',endpoint:'/v1/chat/completions',state:r.error?'error' as const:'done' as const,tokensIn:value(r.prompt_tokens),tokensOut:value(r.output_tokens),cachedTokens:value(r.reused),durationMs:reading(r.duration_s)*1000,model:instance.label,tps:value(r.decode_tok_s),peakTps:value(r.decode_peak_tok_s),promptTps:hasReading(r.prompt_ms)&&r.prompt_ms>0&&hasReading(r.prompt_tokens)&&hasReading(r.reused)?(r.prompt_tokens-r.reused)/(r.prompt_ms/1000):null,usageSource:'reported' as const,finishReason:typeof r.finish_reason==='string'?r.finish_reason:typeof r.finish==='string'?r.finish:undefined,hitRate:value(r.hit_rate),pcieShare:value(r.pcie_share)}))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at));
  const last=requests[0],phase=selected?.phase??'idle',active=['reading','thinking','generating'].includes(phase);
  const used=active?hasReading(live?.prompt_tokens)&&hasReading(live?.generated)?live.prompt_tokens+live.generated:NaN:last&&hasReading(last.tokensIn)&&hasReading(last.tokensOut)?last.tokensIn+last.tokensOut:NaN;
  const maxContext=reading(engine?.max_context??selected?.context);
@@ -41,7 +51,8 @@ export function nativeMonitorData(native:NativeState,inventory:Hardware|null,sel
   prompt:{done:reading(live?.prompt_read),total:reading(live?.prompt_total),pct:hasReading(live?.prompt_read)&&live.prompt_total>0?live.prompt_read/live.prompt_total*100:0},generation:{done:value(live?.generated),total:value(live?.max_tokens)},outputTps:reading(live?.tok_s),promptTps:reading(live?.prefill_tok_s_mean),
   queue:{running:total(scoped.map(instance=>instance.metrics?.live?value(instance.metrics.live.running)??(['reading','generating'].includes(instance.metrics.live.state)?1:0):null)),waiting:total(scoped.map(instance=>value(instance.metrics?.live?.queued)))},
   context:{usedTokens:used,maxTokens:maxContext,pct:hasReading(used)&&maxContext>0?used/maxContext*100:NaN},expertCache:{used:reading(engine?.expert_slots),total:reading(engine?.experts),memoryGb:hasReading(engine?.expert_cache_mib)?engine.expert_cache_mib/1024:null,source:engine&&hasReading(engine.expert_slots)?'engine':'unavailable'},
-  hardware:{gpus,cpuLoad:value(hardware?.cpu_pct??hardware?.cpu),gpuLoad:value(hardware?.gpu_util),vramUsedGb:bytes(hardware?.gpu_mem_used),vramTotalGb:gpuCapacity(inventory?.gpus??[]),ramUsedGb:bytes(hardware?.ram_used),ramTotalGb:bytes(hardware?.ram_total)??inventory?.memory.totalGb??NaN,gpuTempC:value(hardware?.gpu_temp),tempLimitC:90,powerW:value(hardware?.gpu_power),powerLimitW:value(hardware?.gpu_power_limit),pcieRxMbs:value(hardware?.gpu_pcie_rx_mb),diskReadGbs:hasReading(hardware?.disk_read_mb)?hardware.disk_read_mb/1024:null,diskWriteMbs:value(hardware?.disk_write_mb)},history,requests,
+  hardware:{gpus,cpuLoad:value(hardware?.cpu_pct??hardware?.cpu),gpuLoad:value(hardware?.gpu_util),vramUsedGb:bytes(hardware?.gpu_mem_used),vramTotalGb:gpuCapacity(inventory?.gpus??[]),ramUsedGb:bytes(hardware?.ram_used),ramTotalGb:bytes(hardware?.ram_total)??inventory?.memory?.totalGb??NaN,gpuTempC:value(hardware?.gpu_temp),tempLimitC:90,powerW:value(hardware?.gpu_power),powerLimitW:value(hardware?.gpu_power_limit),pcieRxMbs:value(hardware?.gpu_pcie_rx_mb),diskReadGbs:hasReading(hardware?.disk_read_mb)?hardware.disk_read_mb/1024:null,diskWriteMbs:value(hardware?.disk_write_mb)},history,requests,
+  activeRequests,
   mcp:raw?.mcp?{servers:raw.mcp.servers??[],tools:raw.mcp.tools??0}:undefined,
   totals:{tokensIn:tokenTotal('prompt_tokens'),tokensOut:tokenTotal('output_tokens'),requests:tokenTotal('requests'),avgTps:NaN,since:selected?.loadedAt??instances[0]?.loadedAt??new Date().toISOString(),ttftMs:NaN,cachedTokens:tokenTotal('reused'),uncachedTokens:tokenTotal('prompt_tokens')-tokenTotal('reused'),promptMs:hasReading(tokenTotal('prompt_ms'))?tokenTotal('prompt_ms'):undefined,decodeMs:hasReading(tokenTotal('decode_ms'))?tokenTotal('decode_ms'):undefined}
  };

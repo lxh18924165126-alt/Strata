@@ -30,5 +30,22 @@
   "bridge32": "Bridge idle",
   "bridge33": "Client",
   "bridge34": "Protocol / endpoint",
-  "bridge35": "Sharing controls are unavailable while the bridge is enabled."
+  "bridge35": "Sharing controls are unavailable while the bridge is enabled.",
+  "bridge36": "Remote monitoring data is unavailable.",
+  "bridge37": "Turn on local model",
+  "bridge38": "Turn off local model",
+  "bridge39": "Switching local model…",
+  "bridge40": "Local model status unavailable",
+  "bridge41": "Local model switch unavailable",
+  "bridge42": "Could not switch local model",
+  "bridge43": "Enter the API key for this server. If API key management is enabled, use the administrator key.",
+  "bridge44": "Active requests",
+  "bridge45": "Request {0}",
+  "bridge46": "Total generation throughput",
+  "bridge47": "All active requests now",
+  "bridge48": "Prefill per request unavailable",
+  "bridge49": "Prefill tok/s",
+  "bridge50": "{0} input tokens",
+  "bridge51": "Local monitoring data is unavailable.",
+  "bridge52": "API keys and usage"
 }

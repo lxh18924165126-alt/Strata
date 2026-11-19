@@ -25,6 +25,7 @@ const answers = {
   '/api/models': { mode: 'real', variants: [] },
   '/api/engine': { beginner: { contextLength: 8192 }, expert: [] },
   '/api/serving': { state: 'idle' },
+  '/api/bridge': { enabled: false },
   '/api/workspaces': { workspaces: [] },
   '/api/hardware': { gpus: [] },
   '/api/monitor': { cpu: 1 },
@@ -102,4 +103,38 @@ test('a read that fails once is tried again and the app still goes live', async 
   await store.bootstrap();
   assert.equal(snapshot().connection, 'live');
   assert.equal(globalThis.__calls['/api/setup'], 2);
+});
+
+test('a saved bridge opens Monitor even when local setup is incomplete', async () => {
+  reset();
+  answers['/api/bridge'].enabled = true;
+  answers['/api/setup'].complete = false;
+  window.location = { hash: '#/monitor' };
+  try {
+    await store.bootstrap();
+    assert.equal(snapshot().connection, 'live');
+    assert.equal(snapshot().bridge.enabled, true);
+    assert.equal(window.location.hash, '#/monitor');
+  } finally {
+    answers['/api/bridge'].enabled = false;
+    answers['/api/setup'].complete = true;
+    delete window.location;
+  }
+});
+
+test('a service page stays in Monitor with bridge off and desktop setup incomplete', async () => {
+  reset();
+  answers['/api/setup'].complete = false;
+  globalThis.__STRATA_HOST__ = 'http://127.0.0.1:47831';
+  window.location = { hash: '#/monitor' };
+  try {
+    await store.bootstrap();
+    assert.equal(snapshot().connection, 'live');
+    assert.equal(snapshot().bridge.enabled, false);
+    assert.equal(window.location.hash, '#/monitor');
+  } finally {
+    answers['/api/setup'].complete = true;
+    delete globalThis.__STRATA_HOST__;
+    delete window.location;
+  }
 });

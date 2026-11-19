@@ -51,7 +51,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from http.client import HTTPException
+from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -295,7 +295,22 @@ KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet:
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
+PUBLIC_MODEL = "yuxi-v1"
+MODEL_IDENTITY = f"You are {PUBLIC_MODEL}."
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+
+
+def add_model_identity(messages):
+    if not messages or messages[0]["role"] != "system":
+        messages.insert(0, {"role": "system", "content": MODEL_IDENTITY})
+        return
+    content = messages[0]["content"]
+    if isinstance(content, str):
+        if MODEL_IDENTITY not in (part.strip() for part in content.split("\n\n")):
+            messages[0]["content"] = f"{content}\n\n{MODEL_IDENTITY}" if content else MODEL_IDENTITY
+    else:
+        if not any(part.get("text", "").strip() == MODEL_IDENTITY for part in content):
+            messages[0]["content"] = [*content, {"type": "text", "text": f"\n\n{MODEL_IDENTITY}"}]
 
 
 class ContextOverflow(ValueError):
@@ -4927,6 +4942,7 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.key_store = None                          # opt-in, database is authoritative when enabled
+        self.desktop_bridge_port = None
         self.admin_api_key = ""
         self.key_usage = threading.local()              # one HTTP invocation, independent of api_monitor
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -5229,13 +5245,13 @@ class Service:
         self.aliases = names
 
     def model_names(self) -> list[str]:
-        return [self.model, *self.aliases]
+        return list(dict.fromkeys([self.model, *self.aliases, PUBLIC_MODEL]))
 
     def model_for(self, req) -> str:
         """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
-        return asked if isinstance(asked, str) and asked in self.aliases else self.model
+        return asked if isinstance(asked, str) and (asked == PUBLIC_MODEL or asked in self.aliases) else self.model
 
     def reported_ctx(self) -> int:
         """The context the endpoints report (/v1/status, /v1/models, /props, /health, /slots, /metrics): the engine's,
@@ -8605,6 +8621,11 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
+                    bridge = self._desktop_bridge_model()
+                    if bridge is not None:
+                        if bridge:
+                            self._desktop_bridge("GET", "/v1/models")
+                        return
                     if svc.model_router:
                         assigned = svc.key_store.model(self.key_id) or svc.model_router.default
                         if assigned not in svc.model_router.available():
@@ -8618,6 +8639,8 @@ def make_handler(svc: Service):
                                          architecture={"input_modalities": ["text", "image"] if svc.vision else ["text"],
                                                        "output_modalities": ["text"]})
                         data = [model] if svc.model_enabled else []
+                        if data and assigned != PUBLIC_MODEL:
+                            data.append({**model, "id": PUBLIC_MODEL, "alias_of": assigned})
                         if svc.images is not None:
                             data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                          "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
@@ -8633,7 +8656,7 @@ def make_handler(svc: Service):
                         loaded = True
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
-                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
+                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.model_names()[1:])]
                     data = data if loaded and svc.model_enabled else []
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
@@ -8667,6 +8690,123 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _desktop_bridge_model(self):
+            if not svc.desktop_bridge_port:
+                return None
+            conn = HTTPConnection("127.0.0.1", svc.desktop_bridge_port, timeout=2)
+            try:
+                conn.request("GET", "/api/bridge")
+                with conn.getresponse() as response:
+                    state = json.loads(response.read(65536)) if response.status == 200 else None
+                if isinstance(state, dict):
+                    if state.get("enabled") is False:
+                        return None
+                    model = state.get("model")
+                    if state.get("enabled") is True and isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
+                        return model["id"]
+            except ConnectionRefusedError:
+                return None  # Desktop is closed. Use the original local route.
+            except (OSError, HTTPException, ValueError) as e:
+                print(f"[strata] bridge state error: {e}", flush=True)
+            finally:
+                conn.close()
+            self._json(502, {"error": {"message": "Could not read the desktop bridge state"}})
+            return ""  # The error response was already sent.
+
+        def _desktop_bridge(self, method, path):
+            headers = {"x-strata-bridge-only": "1"}
+            for name in ("anthropic-version", "anthropic-beta", "user-agent"):
+                if name in self.headers:
+                    headers[name] = self.headers[name]
+            body, hide_usage = None, False
+            if method == "POST":
+                try:
+                    request = json.loads(self._body() or b"{}")
+                    if not isinstance(request, dict):
+                        raise ValueError("not an object")
+                except ValueError:
+                    self._json(400, {"error": {"message": "Send a JSON object"}})
+                    return
+                if self.usage is not None and path == "/v1/chat/completions" and request.get("stream") is True:
+                    options = request.get("stream_options") or {}
+                    if not isinstance(options, dict):
+                        self._json(400, {"error": {"message": "stream_options must be an object"}})
+                        return
+                    hide_usage = options.get("include_usage") is not True
+                    request["stream_options"] = {**options, "include_usage": True}
+                headers["content-type"] = "application/json"
+                body = json.dumps(request).encode()
+
+            tokens = {}
+            accounted = False
+
+            def observe(event):
+                if self.usage is None:
+                    return
+                self.usage.note({"error": event.get("error") or event.get("type") in ("error", "response.failed")})
+                for payload in (event, event.get("message"), event.get("response")):
+                    usage = payload.get("usage") if isinstance(payload, dict) else None
+                    if not isinstance(usage, dict):
+                        continue
+                    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+                    cached = details.get("cached_tokens") if isinstance(details, dict) else usage.get("cache_read_input_tokens")
+                    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+                    if type(prompt) is int:
+                        prompt += sum(n for n in (usage.get("cache_read_input_tokens"), usage.get("cache_creation_input_tokens"))
+                                      if type(n) is int and n >= 0)
+                    for field, count in (("prompt", prompt), ("cached", cached), ("output", usage.get("completion_tokens", usage.get("output_tokens")))):
+                        if type(count) is int and count >= 0:
+                            tokens[field] = count
+
+            def account(finish=None):
+                nonlocal accounted
+                if self.usage is not None and not accounted:
+                    self.usage.add(tokens.get("prompt", 0), tokens.get("cached", 0), tokens.get("output", 0), finish)
+                    accounted = True
+
+            conn = HTTPConnection("127.0.0.1", svc.desktop_bridge_port, timeout=300)
+            try:
+                conn.request(method, path, body, headers)
+                with conn.getresponse() as response:
+                    forwarded = {name: value for name in ("x-strata-request-id", "retry-after")
+                                 if (value := response.getheader(name)) is not None}
+                    if response.getheader("Content-Type", "").startswith("text/event-stream"):
+                        self.send_response(response.status)
+                        self._cors()
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("X-Accel-Buffering", "no")
+                        for name, value in forwarded.items():
+                            self.send_header(name, value)
+                        self.end_headers()
+                        while line := response.readline(16 << 20):
+                            if line.startswith(b"data:") and line[5:].lstrip().startswith(b"{"):
+                                event = json.loads(line[5:])
+                                observe(event)
+                                if hide_usage and "usage" in event:
+                                    if event["usage"] and event.get("choices") == []:
+                                        continue
+                                    event.pop("usage")
+                                    line = b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n"
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                        account()
+                    else:
+                        data = json.loads(response.read(16 << 20))
+                        if not isinstance(data, dict):
+                            raise ValueError("invalid bridge response")
+                        observe(data)
+                        account()
+                        self._json(response.status, data, headers=forwarded)
+            except (OSError, HTTPException, ValueError) as e:
+                print(f"[strata] bridge transport error: {e}", flush=True)
+                if not self.answer_started:
+                    self._json(502, {"error": {"message": "Could not complete the desktop bridge request"}})
+                else:
+                    account("disconnect" if isinstance(e, (BrokenPipeError, ConnectionResetError)) else "error")
+            finally:
+                conn.close()
+
         def do_POST(self):
             try:
                 path = self.path.split("?")[0].rstrip("/")
@@ -8674,8 +8814,21 @@ def make_handler(svc: Service):
                 routed = ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/messages/count_tokens")
                 controlled = ("/api/model", "/load", "/unload", "/v1/load", "/v1/unload", "/v1/vram",
                               "/v1/images/generations")
+                authorized = False
+                if svc.desktop_bridge_port and path in routed:
+                    if not self._authorized():
+                        return
+                    authorized = True
+                    bridge = self._desktop_bridge_model()
+                    if bridge is not None:
+                        if not bridge or self._foreign_page():
+                            return
+                        if svc.key_store is not None and path != "/v1/messages/count_tokens":
+                            self.usage = svc.key_store.begin(self.key_id, path, bridge)
+                        self._desktop_bridge("POST", path)
+                        return
                 if svc.model_router and path in routed:
-                    if not self._authorized() or self._foreign_page():
+                    if (not authorized and not self._authorized()) or self._foreign_page():
                         return
                     assigned = None
                     def target():
@@ -8698,7 +8851,7 @@ def make_handler(svc: Service):
                     with svc.model_router.access():
                         self._post()
                 else:
-                    self._post()
+                    self._post(authorized=authorized)
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except QuotaExceeded as e:
@@ -8746,7 +8899,7 @@ def make_handler(svc: Service):
                 except OSError:
                     pass
 
-        def _post(self):
+        def _post(self, authorized=False):
             path = self.path.split("?")[0].rstrip("/")
             if path == "/api/model":
                 self._model_control(post=True)
@@ -8754,7 +8907,7 @@ def make_handler(svc: Service):
             if path == "/api/keys" or path.startswith("/api/keys/"):
                 self._keys_api(path, post=True)
                 return
-            if self.usage is None and not self._authorized():
+            if not authorized and self.usage is None and not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
@@ -9206,6 +9359,7 @@ def make_handler(svc: Service):
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
+            add_model_identity(messages)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
@@ -9408,6 +9562,7 @@ def make_handler(svc: Service):
         def _responses_prepare(self, req, cancel=None):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
+            add_model_identity(messages)
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
@@ -9470,6 +9625,7 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            add_model_identity(messages)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
@@ -9478,6 +9634,7 @@ def make_handler(svc: Service):
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            add_model_identity(messages)
             self._no_local_images(messages)
             callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
@@ -10967,6 +11124,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if not svc.api_key and svc.key_store is None and "api_key" in cfg and not no_key_chosen:  # #569: explicitly empty
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    if (bridge_port := cfg.get("desktop_bridge_port")) is not None:
+        if type(bridge_port) is not int or not 1024 <= bridge_port <= 65535 or bridge_port == a.port:
+            ap.error("desktop_bridge_port must be a different loopback port in 1024..65535")
+        if not svc.api_key and svc.key_store is None:
+            ap.error("desktop_bridge_port requires API key authentication")
+        svc.desktop_bridge_port = bridge_port
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:

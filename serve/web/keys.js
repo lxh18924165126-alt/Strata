@@ -3,14 +3,15 @@
 (() => {
   const el = id => document.getElementById(`keys-${id}`);
   let admin = "", selected = null, pendingDelete = null, pendingQuota = null, revision = 0, refreshTimer = null, rows = [], models = [], defaultModel = "";
-  try { admin = sessionStorage.getItem("strata.keys.admin") || ""; } catch (_) {}
+  const credentialSlot = document.body?.dataset.adminSlot || "strata.keys.admin";
+  try { admin = sessionStorage.getItem(credentialSlot) || ""; } catch (_) {}
   const states = {active: "启用", disabled: "已停用", deleted: "已删除"};
   const number = n => Number(n || 0).toLocaleString("zh-CN");
   const stamp = t => t != null ? new Date(t * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false}) : "尚无调用";
   function message(text = "", error = false) { el("message").textContent = text; el("message").dataset.error = String(error); }
   function credential(value) {
     admin = value;
-    try { if (value) sessionStorage.setItem("strata.keys.admin", value); else sessionStorage.removeItem("strata.keys.admin"); } catch (_) {}
+    try { if (value) sessionStorage.setItem(credentialSlot, value); else sessionStorage.removeItem(credentialSlot); } catch (_) {}
   }
   function clearSecret() { el("secret-value").value = ""; el("copy-status").textContent = ""; }
   function logout() {

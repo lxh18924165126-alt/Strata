@@ -15,6 +15,7 @@ import { dismissActionError, dismissToast, holdToast, releaseToast, useStore } f
 import { isTopSurface, useSurfaceFocus } from '../lib/focus';
 import { measureFrame, placeAnchored } from '../lib/overlay-place';
 /* -------------------------------------------------------------------- icon */
+const iconSprite = typeof document !== 'undefined' && document.getElementById('strata-desktop-sprite') ? '' : '/icons/sprite.svg';
 export type IconName = 'pause' | 'play' | 'activity' | 'plus' | 'shield' | 'computer'
 // Authored for the shell: see docs/design-system-notes.md.
  | 'panel' | 'search' | 'sliders' | 'folder' | 'folder-plus' | 'file' | 'ellipsis' | 'pencil' | 'pin' | 'x' | 'attach' | 'bolt' | 'branch' | 'chat' | 'check' | 'chevron' | 'clock' | 'copy' | 'cpu' | 'disk' | 'download' | 'error' | 'experts' | 'gauge' | 'gpu' | 'image' | 'info' | 'expand' | 'contract' | 'layers' | 'models' | 'skills' | 'engine' | 'family-qwen' | 'model-file' | 'link' | 'memory' | 'mic' | 'moon' | 'new-chat' | 'refresh' | 'send' | 'settings' | 'stop' | 'sun' | 'thermometer' | 'thinking' | 'tool' | 'trash' | 'warning';
@@ -25,7 +26,7 @@ export function Icon({ name, size, className, style, }: {
     style?: CSSProperties;
 }) {
     return (<svg className={cx('st-icon', className)} style={{ width: size, height: size, ...style }} aria-hidden="true" focusable="false">
-      <use href={`/icons/sprite.svg#i-${name}`}/>
+      <use href={`${iconSprite}#i-${name}`}/>
     </svg>);
 }
 /* ------------------------------------------------------------------ button */

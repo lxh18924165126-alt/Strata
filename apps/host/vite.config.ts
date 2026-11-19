@@ -1,4 +1,5 @@
-import { defineConfig } from 'vite';
+import { fileURLToPath } from 'node:url';
+import { defineConfig, searchForWorkspaceRoot } from 'vite';
 import react from '@vitejs/plugin-react';
 
 /**
@@ -9,6 +10,8 @@ import react from '@vitejs/plugin-react';
  * origin, exactly like the packaged app does.
  */
 export default defineConfig({
+  // Preload chunks beside their module when the shell is loaded from a separate loopback origin.
+  base: './',
   plugins: [
     react(),
     {
@@ -23,6 +26,7 @@ export default defineConfig({
     },
   ],
   server: {
+    fs: { allow: [searchForWorkspaceRoot(process.cwd()), fileURLToPath(new URL('../../serve/web', import.meta.url))] },
     port: 5199,
     strictPort: true,
     proxy: {

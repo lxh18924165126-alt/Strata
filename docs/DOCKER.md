@@ -287,7 +287,15 @@ and the model server's API key. Test the connection, choose a model, and enable 
 when reopened and skips loading a local model. If the tunnel closes, reopen it and test the connection again.
 
 Apps on the desktop computer can keep using its existing local Strata API address and local API key. The desktop's Monitor
-shows usage reported for requests it forwarded during the current run. A disconnected request may report only part of its usage.
+reads hardware usage, model activity, and recent requests from the model server. If the server's monitoring endpoint is
+unavailable, the desktop shows a message in Monitor.
+
+In the paired setup, open the local Strata service at `http://127.0.0.1:18907`. Its page uses the desktop Host at port
+`47831` for the interface and bridge settings. Use the local administrator key for API Key management and the local
+call key for chat. The local service applies key limits and records usage in both bridge modes. Its model switch controls
+the local model. Switching the bridge changes where model requests run and where Monitor reads its data.
+
+For the Windows-to-Ubuntu request path and a step-by-step test on another server, see the [Ubuntu bridge guide](UBUNTU_BRIDGE.md).
 
 ## Watch it and stop it
 
